@@ -2,39 +2,19 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
- 
 
 // Middleware
 app.use(express.json({ limit: '50mb' }));
 app.use(cors());
 
-// MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI; 
+// ============= SCHEMA AND MODEL =============
+// FIX #1 (from prior review): Schema defined BEFORE model creation
 
-
-function generateHash(record) {
-    const crypto = require('crypto');
-    const sortedRecord = {};
-    Object.keys(record).sort().forEach(key => {
-        sortedRecord[key] = record[key];
-    });
-    return crypto.createHash('md5').update(JSON.stringify(sortedRecord)).digest('hex');
-}
-
-
-
-mongoose.connect(MONGODB_URI)
-    .then(() => console.log('✅ Connected to MongoDB'))
-    .catch(err => {
-        console.error('❌ MongoDB connection error:', err.message);
-        process.exit(1);
-    });
-
-// Schema for stored data
 const recordSchema = new mongoose.Schema({
     tableName: { type: String, required: true, index: true },
     recordId: { type: String, required: true },
@@ -46,16 +26,36 @@ const recordSchema = new mongoose.Schema({
 
 recordSchema.index({ tableName: 1, recordId: 1 }, { unique: true });
 recordSchema.index({ createdAt: 1 });
+recordSchema.index({ updatedAt: 1 });
 
-const Record = mongoose.model('Record', recordSchema); 
+const Record = mongoose.model('Record', recordSchema);
 
+// ============= MONGODB CONNECTION =============
 
-// Helper function
+const MONGODB_URI = process.env.MONGODB_URI;
+
+mongoose.connect(MONGODB_URI)
+    .then(() => console.log('✅ Connected to MongoDB'))
+    .catch(err => {
+        console.error('❌ MongoDB connection error:', err.message);
+        process.exit(1);
+    });
+
+// ============= HELPERS =============
+
+function generateHash(record) {
+    const sortedRecord = {};
+    Object.keys(record).sort().forEach(key => {
+        sortedRecord[key] = record[key];
+    });
+    return crypto.createHash('md5').update(JSON.stringify(sortedRecord)).digest('hex');
+}
+
 function getRecordId(record) {
     if (record.id !== undefined && record.id !== null) return String(record.id);
     if (record.ID !== undefined && record.ID !== null) return String(record.ID);
     if (record.AUTOID !== undefined && record.AUTOID !== null) return String(record.AUTOID);
-    
+
     const idFields = ['Id', '_id', 'recordId', 'RecordId', 'rowId', 'RowId'];
     for (const field of idFields) {
         if (record[field] !== undefined && record[field] !== null) {
@@ -67,21 +67,25 @@ function getRecordId(record) {
 
 // ============= API ENDPOINTS =============
 
-// Get all data for a table
+// Get all data for a table (with optional ?ids= filter)
 app.get('/api/data/:tableName', async (req, res) => {
     try {
         const { tableName } = req.params;
         const { ids } = req.query;
 
+        console.log(`📊 Fetching data for table: ${tableName}${ids ? ` (filtered: ${ids.split(',').length} IDs)` : ''}`);
+
+        // FIX #1: Support filtering by IDs via query param
         const query = { tableName };
         if (ids) {
-            const idArray = ids.split(',');
-            query.recordId = { $in: idArray }; // ✅ Filter by IDs
+            const idArray = ids.split(',').map(id => id.trim()).filter(Boolean);
+            if (idArray.length > 0) {
+                query.recordId = { $in: idArray };
+            }
         }
-        console.log(`📊 Fetching all data for table: ${tableName}`);
-        
+
         const records = await Record.find(query).sort({ createdAt: -1 });
-        
+
         res.json({
             success: true,
             tableName,
@@ -98,37 +102,66 @@ app.get('/api/data/:tableName', async (req, res) => {
     }
 });
 
+// FIX #1: New POST endpoint to fetch records by IDs (avoids URL length limits)
+app.post('/api/data/:tableName/by-ids', async (req, res) => {
+    try {
+        const { tableName } = req.params;
+        const { ids } = req.body;
+
+        if (!ids || !Array.isArray(ids)) {
+            return res.status(400).json({ success: false, error: 'ids array is required in request body' });
+        }
+
+        console.log(`📊 Fetching ${ids.length} records by ID for table: ${tableName}`);
+
+        const records = await Record.find({
+            tableName,
+            recordId: { $in: ids.map(String) }
+        });
+
+        res.json({
+            success: true,
+            tableName,
+            count: records.length,
+            records: records.map(r => ({
+                ...r.data,
+                _syncMeta: { hash: r.hash, updatedAt: r.updatedAt }
+            })),
+            // Also return hash map so local server can compare without re-hashing
+            hashMap: Object.fromEntries(records.map(r => [r.recordId, r.hash]))
+        });
+    } catch (error) {
+        console.error('Error fetching records by IDs:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Get today's data for a table
 app.get('/api/data/today/:tableName', async (req, res) => {
     try {
         const { tableName } = req.params;
         console.log(`📅 Fetching today's data for table: ${tableName}`);
-        
+
         const startOfDay = new Date();
         startOfDay.setHours(0, 0, 0, 0);
-        
         const endOfDay = new Date();
         endOfDay.setHours(23, 59, 59, 999);
-        
+
         const records = await Record.find({
             tableName,
             createdAt: { $gte: startOfDay, $lte: endOfDay }
         }).sort({ createdAt: -1 });
-        
+
         res.json({
             success: true,
             tableName,
             date: startOfDay,
             count: records.length,
             records: records.map(r => r.data),
-            metadata: {
-                startOfDay,
-                endOfDay,
-                totalRecords: records.length
-            }
+            metadata: { startOfDay, endOfDay, totalRecords: records.length }
         });
     } catch (error) {
-        console.error('Error fetching today\'s data:', error);
+        console.error("Error fetching today's data:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -138,20 +171,20 @@ app.get('/api/data/range/:tableName', async (req, res) => {
     try {
         const { tableName } = req.params;
         const { startDate, endDate } = req.query;
-        
+
         if (!startDate || !endDate) {
             return res.status(400).json({ success: false, error: 'startDate and endDate are required' });
         }
-        
+
         const start = new Date(startDate);
         const end = new Date(endDate);
         end.setHours(23, 59, 59, 999);
-        
+
         const records = await Record.find({
             tableName,
             createdAt: { $gte: start, $lte: end }
         }).sort({ createdAt: -1 });
-        
+
         res.json({
             success: true,
             tableName,
@@ -171,20 +204,17 @@ app.get('/api/data/:tableName/:recordId', async (req, res) => {
     try {
         const { tableName, recordId } = req.params;
         console.log(`🔍 Fetching record ${recordId} from ${tableName}`);
-        
+
         const record = await Record.findOne({ tableName, recordId });
-        
+
         if (!record) {
             return res.status(404).json({ success: false, error: 'Record not found' });
         }
-        
+
         res.json({
             success: true,
             record: record.data,
-            metadata: {
-                createdAt: record.createdAt,
-                updatedAt: record.updatedAt
-            }
+            metadata: { createdAt: record.createdAt, updatedAt: record.updatedAt }
         });
     } catch (error) {
         console.error('Error fetching record:', error);
@@ -197,30 +227,21 @@ app.get('/api/stats/:tableName', async (req, res) => {
     try {
         const { tableName } = req.params;
         console.log(`📈 Fetching stats for table: ${tableName}`);
-        
+
         const totalCount = await Record.countDocuments({ tableName });
-        
+
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-        const todayCount = await Record.countDocuments({
-            tableName,
-            createdAt: { $gte: today }
-        });
-        
+        const todayCount = await Record.countDocuments({ tableName, createdAt: { $gte: today } });
+
         const lastWeek = new Date();
         lastWeek.setDate(lastWeek.getDate() - 7);
-        const weekCount = await Record.countDocuments({
-            tableName,
-            createdAt: { $gte: lastWeek }
-        });
-        
+        const weekCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastWeek } });
+
         const lastMonth = new Date();
         lastMonth.setMonth(lastMonth.getMonth() - 1);
-        const monthCount = await Record.countDocuments({
-            tableName,
-            createdAt: { $gte: lastMonth }
-        });
-        
+        const monthCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastMonth } });
+
         res.json({
             success: true,
             tableName,
@@ -236,48 +257,39 @@ app.get('/api/stats/:tableName', async (req, res) => {
         console.error('Error fetching stats:', error);
         res.status(500).json({ success: false, error: error.message });
     }
-}); 
+});
 
-
-
+// Receive and process sync changes from local server
 app.post('/api/sync/changes', async (req, res) => {
     try {
         const { tableName, changes } = req.body;
-        
+
         console.log(`\n════════════════════════════════════════════`);
         console.log(`📥 SYNC CHANGES RECEIVED`);
         console.log(`Table: ${tableName}`);
         console.log(`Added: ${changes.added?.length || 0}`);
         console.log(`Updated: ${changes.updated?.length || 0}`);
         console.log(`Deleted: ${changes.deleted?.length || 0}`);
-        
-        // Log the structure of first update if exists
-        if (changes.updated && changes.updated.length > 0) {
-            console.log(`   First update structure:`, Object.keys(changes.updated[0]));
-            console.log(`   Has 'new' property:`, !!changes.updated[0].new);
-            console.log(`   Has 'old' property:`, !!changes.updated[0].old);
-        }
-        
+
         if (!tableName || !changes) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Invalid request: tableName and changes required' 
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid request: tableName and changes required'
             });
         }
-        
-        const results = {
-            added: 0,
-            updated: 0,
-            deleted: 0,
-            errors: 0,
-            ignored: 0
-        };
-        
+
+        const results = { added: 0, updated: 0, deleted: 0, errors: 0, ignored: 0 };
+
         // Process added records
         if (changes.added && Array.isArray(changes.added)) {
             for (const record of changes.added) {
                 try {
                     const recordId = getRecordId(record);
+                    if (!recordId) {
+                        console.log(`  ⚠️ Could not extract ID from added record`);
+                        results.errors++;
+                        continue;
+                    }
                     await Record.findOneAndUpdate(
                         { tableName, recordId },
                         {
@@ -287,7 +299,7 @@ app.post('/api/sync/changes', async (req, res) => {
                             hash: generateHash(record),
                             updatedAt: new Date()
                         },
-                        { upsert: true }
+                        { upsert: true, new: true }
                     );
                     results.added++;
                     console.log(`  ✅ Added: ${recordId}`);
@@ -297,47 +309,22 @@ app.post('/api/sync/changes', async (req, res) => {
                 }
             }
         }
-        
-        // Process updated records - FIXED to handle {old, new} structure
+
+        // Process updated records
+        // Local server sends plain records (not {old, new}) — pushChangesInBatches handles this
         if (changes.updated && Array.isArray(changes.updated)) {
             for (const updateItem of changes.updated) {
                 try {
-                    // Extract the actual record (handle both formats)
-                    let record = updateItem;
-                    
-                    // If it has a 'new' property, use that (local server sends {old, new})
-                    if (updateItem.new) {
-                        record = updateItem.new;
-                        console.log(`  📝 Processing update with 'new' record`);
-                    }
-                    
+                    // Handle both formats defensively: plain record or {old, new}
+                    const record = updateItem.new !== undefined ? updateItem.new : updateItem;
+
                     const recordId = getRecordId(record);
-                    
                     if (!recordId) {
-                        console.log(`  ⚠️ Could not extract ID from record:`, record);
+                        console.log(`  ⚠️ Could not extract ID from updated record`);
                         results.errors++;
                         continue;
                     }
-                    
-                    // Check if the update is recent (less than 7 days old)
-                    const timestampFields = ['updatedAt', 'updated_at', 'lastModified', 'modified', 'timestamp', 'date'];
-                    let recordDate = null;
-                    for (const field of timestampFields) {
-                        if (record[field]) {
-                            recordDate = new Date(record[field]);
-                            break;
-                        }
-                    }
-                    
-                    const oneWeekAgo = new Date();
-                    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-                    
-                    if (recordDate && recordDate < oneWeekAgo) {
-                        console.log(`  ⏭️ Ignored old update: ${recordId} (${recordDate})`);
-                        results.ignored++;
-                        continue;
-                    }
-                    
+
                     await Record.findOneAndUpdate(
                         { tableName, recordId },
                         {
@@ -347,7 +334,7 @@ app.post('/api/sync/changes', async (req, res) => {
                             hash: generateHash(record),
                             updatedAt: new Date()
                         },
-                        { upsert: true }
+                        { upsert: true, new: true }
                     );
                     results.updated++;
                     console.log(`  ✅ Updated: ${recordId}`);
@@ -357,12 +344,17 @@ app.post('/api/sync/changes', async (req, res) => {
                 }
             }
         }
-        
+
         // Process deleted records
         if (changes.deleted && Array.isArray(changes.deleted)) {
             for (const record of changes.deleted) {
                 try {
                     const recordId = getRecordId(record);
+                    if (!recordId) {
+                        console.log(`  ⚠️ Could not extract ID from deleted record`);
+                        results.errors++;
+                        continue;
+                    }
                     await Record.deleteOne({ tableName, recordId });
                     results.deleted++;
                     console.log(`  ✅ Deleted: ${recordId}`);
@@ -372,29 +364,25 @@ app.post('/api/sync/changes', async (req, res) => {
                 }
             }
         }
-        
-        console.log(`✅ Sync changes completed:`);
-        console.log(`   Added: ${results.added}, Updated: ${results.updated}, Deleted: ${results.deleted}, Ignored: ${results.ignored}, Errors: ${results.errors}`);
-        
+
         const totalRecords = await Record.countDocuments({ tableName });
+
+        console.log(`✅ Sync results: +${results.added} ~${results.updated} -${results.deleted} ✗${results.errors}`);
         console.log(`   Total records in remote DB: ${totalRecords}`);
-        
+        console.log(`════════════════════════════════════════════\n`);
+
         res.json({
             success: true,
             message: 'Changes synced successfully',
             stats: results,
-            totalRecords: totalRecords
+            totalRecords
         });
-        
+
     } catch (error) {
         console.error('❌ Sync error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
-
 
 // Health check
 app.get('/health', (req, res) => {
@@ -405,17 +393,20 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Start server
+// ============= START SERVER =============
+
 app.listen(PORT, () => {
     console.log(`
     ════════════════════════════════════════════════════
     🚀 Remote Data Server is running!
     ════════════════════════════════════════════════════
     📡 Server URL: http://localhost:${PORT}
-    📊 Get All Data: GET /api/data/:tableName
-    📅 Get Today's Data: GET /api/data/today/:tableName
-    📈 Get Stats: GET /api/stats/:tableName
-    💚 Health: GET /health
+    📊 Get All Data:      GET  /api/data/:tableName
+    🔍 Get By IDs:        POST /api/data/:tableName/by-ids
+    📅 Get Today's Data:  GET  /api/data/today/:tableName
+    📈 Get Stats:         GET  /api/stats/:tableName
+    🔄 Receive Changes:   POST /api/sync/changes
+    💚 Health:            GET  /health
     ════════════════════════════════════════════════════
     `);
 });
