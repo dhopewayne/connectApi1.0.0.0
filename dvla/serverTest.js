@@ -6,26 +6,13 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
- 
 
 // Middleware
 app.use(express.json({ limit: '50mb' }));
 app.use(cors());
 
 // MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI; 
-
-
-function generateHash(record) {
-    const crypto = require('crypto');
-    const sortedRecord = {};
-    Object.keys(record).sort().forEach(key => {
-        sortedRecord[key] = record[key];
-    });
-    return crypto.createHash('md5').update(JSON.stringify(sortedRecord)).digest('hex');
-}
-
-
+const MONGODB_URI = process.env.MONGODB_URI;
 
 mongoose.connect(MONGODB_URI)
     .then(() => console.log('✅ Connected to MongoDB'))
@@ -47,14 +34,12 @@ const recordSchema = new mongoose.Schema({
 recordSchema.index({ tableName: 1, recordId: 1 }, { unique: true });
 recordSchema.index({ createdAt: 1 });
 
-const Record = mongoose.model('Record', recordSchema); 
-
+const Record = mongoose.model('Record', recordSchema);
 
 // Helper function
 function getRecordId(record) {
     if (record.id !== undefined && record.id !== null) return String(record.id);
     if (record.ID !== undefined && record.ID !== null) return String(record.ID);
-    if (record.AUTOID !== undefined && record.AUTOID !== null) return String(record.AUTOID);
     
     const idFields = ['Id', '_id', 'recordId', 'RecordId', 'rowId', 'RowId'];
     for (const field of idFields) {
@@ -71,16 +56,9 @@ function getRecordId(record) {
 app.get('/api/data/:tableName', async (req, res) => {
     try {
         const { tableName } = req.params;
-        const { ids } = req.query;
-
-        const query = { tableName };
-        if (ids) {
-            const idArray = ids.split(',');
-            query.recordId = { $in: idArray }; // ✅ Filter by IDs
-        }
         console.log(`📊 Fetching all data for table: ${tableName}`);
         
-        const records = await Record.find(query).sort({ createdAt: -1 });
+        const records = await Record.find({ tableName }).sort({ createdAt: -1 });
         
         res.json({
             success: true,
@@ -236,165 +214,7 @@ app.get('/api/stats/:tableName', async (req, res) => {
         console.error('Error fetching stats:', error);
         res.status(500).json({ success: false, error: error.message });
     }
-}); 
-
-
-
-app.post('/api/sync/changes', async (req, res) => {
-    try {
-        const { tableName, changes } = req.body;
-        
-        console.log(`\n════════════════════════════════════════════`);
-        console.log(`📥 SYNC CHANGES RECEIVED`);
-        console.log(`Table: ${tableName}`);
-        console.log(`Added: ${changes.added?.length || 0}`);
-        console.log(`Updated: ${changes.updated?.length || 0}`);
-        console.log(`Deleted: ${changes.deleted?.length || 0}`);
-        
-        // Log the structure of first update if exists
-        if (changes.updated && changes.updated.length > 0) {
-            console.log(`   First update structure:`, Object.keys(changes.updated[0]));
-            console.log(`   Has 'new' property:`, !!changes.updated[0].new);
-            console.log(`   Has 'old' property:`, !!changes.updated[0].old);
-        }
-        
-        if (!tableName || !changes) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Invalid request: tableName and changes required' 
-            });
-        }
-        
-        const results = {
-            added: 0,
-            updated: 0,
-            deleted: 0,
-            errors: 0,
-            ignored: 0
-        };
-        
-        // Process added records
-        if (changes.added && Array.isArray(changes.added)) {
-            for (const record of changes.added) {
-                try {
-                    const recordId = getRecordId(record);
-                    await Record.findOneAndUpdate(
-                        { tableName, recordId },
-                        {
-                            tableName,
-                            recordId,
-                            data: record,
-                            hash: generateHash(record),
-                            updatedAt: new Date()
-                        },
-                        { upsert: true }
-                    );
-                    results.added++;
-                    console.log(`  ✅ Added: ${recordId}`);
-                } catch (error) {
-                    console.error(`  ❌ Failed to add:`, error.message);
-                    results.errors++;
-                }
-            }
-        }
-        
-        // Process updated records - FIXED to handle {old, new} structure
-        if (changes.updated && Array.isArray(changes.updated)) {
-            for (const updateItem of changes.updated) {
-                try {
-                    // Extract the actual record (handle both formats)
-                    let record = updateItem;
-                    
-                    // If it has a 'new' property, use that (local server sends {old, new})
-                    if (updateItem.new) {
-                        record = updateItem.new;
-                        console.log(`  📝 Processing update with 'new' record`);
-                    }
-                    
-                    const recordId = getRecordId(record);
-                    
-                    if (!recordId) {
-                        console.log(`  ⚠️ Could not extract ID from record:`, record);
-                        results.errors++;
-                        continue;
-                    }
-                    
-                    // Check if the update is recent (less than 7 days old)
-                    const timestampFields = ['updatedAt', 'updated_at', 'lastModified', 'modified', 'timestamp', 'date'];
-                    let recordDate = null;
-                    for (const field of timestampFields) {
-                        if (record[field]) {
-                            recordDate = new Date(record[field]);
-                            break;
-                        }
-                    }
-                    
-                    const oneWeekAgo = new Date();
-                    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-                    
-                    if (recordDate && recordDate < oneWeekAgo) {
-                        console.log(`  ⏭️ Ignored old update: ${recordId} (${recordDate})`);
-                        results.ignored++;
-                        continue;
-                    }
-                    
-                    await Record.findOneAndUpdate(
-                        { tableName, recordId },
-                        {
-                            tableName,
-                            recordId,
-                            data: record,
-                            hash: generateHash(record),
-                            updatedAt: new Date()
-                        },
-                        { upsert: true }
-                    );
-                    results.updated++;
-                    console.log(`  ✅ Updated: ${recordId}`);
-                } catch (error) {
-                    console.error(`  ❌ Failed to update:`, error.message);
-                    results.errors++;
-                }
-            }
-        }
-        
-        // Process deleted records
-        if (changes.deleted && Array.isArray(changes.deleted)) {
-            for (const record of changes.deleted) {
-                try {
-                    const recordId = getRecordId(record);
-                    await Record.deleteOne({ tableName, recordId });
-                    results.deleted++;
-                    console.log(`  ✅ Deleted: ${recordId}`);
-                } catch (error) {
-                    console.error(`  ❌ Failed to delete:`, error.message);
-                    results.errors++;
-                }
-            }
-        }
-        
-        console.log(`✅ Sync changes completed:`);
-        console.log(`   Added: ${results.added}, Updated: ${results.updated}, Deleted: ${results.deleted}, Ignored: ${results.ignored}, Errors: ${results.errors}`);
-        
-        const totalRecords = await Record.countDocuments({ tableName });
-        console.log(`   Total records in remote DB: ${totalRecords}`);
-        
-        res.json({
-            success: true,
-            message: 'Changes synced successfully',
-            stats: results,
-            totalRecords: totalRecords
-        });
-        
-    } catch (error) {
-        console.error('❌ Sync error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
 });
-
 
 // Health check
 app.get('/health', (req, res) => {
