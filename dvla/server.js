@@ -134,7 +134,8 @@ app.post('/api/data/:tableName/by-ids', async (req, res) => {
         console.error('Error fetching records by IDs:', error);
         res.status(500).json({ success: false, error: error.message });
     }
-});
+}); 
+
 
 // Get today's data for a table
 app.get('/api/data/today/:tableName', async (req, res) => {
@@ -382,7 +383,55 @@ app.post('/api/sync/changes', async (req, res) => {
         console.error('❌ Sync error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
+});  
+ 
+
+// Get the last (highest) record ID for a table — used by local server fast-path check
+app.get('/api/data/:tableName/last-id', async (req, res) => {
+    try {
+        const { tableName } = req.params;
+        console.log(`🆔 Fetching last record ID for table: ${tableName}`);
+
+        // Sort by recordId descending — works for both numeric and string IDs
+        // For numeric IDs stored as strings, we fetch all and sort in JS for accuracy
+        const totalCount = await Record.countDocuments({ tableName });
+
+        if (totalCount === 0) {
+            return res.json({ success: true, lastId: null, totalCount: 0 });
+        }
+
+        // Try numeric sort first (cast recordId to int in aggregation)
+        let lastRecord = null;
+        try {
+            const result = await Record.aggregate([
+                { $match: { tableName } },
+                {
+                    $addFields: {
+                        numericId: { $toInt: '$recordId' }
+                    }
+                },
+                { $sort: { numericId: -1 } },
+                { $limit: 1 }
+            ]);
+            lastRecord = result[0] || null;
+        } catch {
+            // recordId is not numeric — fall back to lexicographic sort
+            lastRecord = await Record.findOne({ tableName }).sort({ recordId: -1 }).lean();
+        }
+
+        res.json({
+            success: true,
+            lastId: lastRecord?.recordId || null,
+            totalCount
+        });
+    } catch (error) {
+        console.error('Error fetching last ID:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
+
+
+
 
 // Health check
 app.get('/health', (req, res) => {
