@@ -386,50 +386,21 @@ app.post('/api/sync/changes', async (req, res) => {
 });  
  
 
-// Get the last (highest) record ID for a table — used by local server fast-path check
+
 app.get('/api/data/:tableName/last-id', async (req, res) => {
     try {
         const { tableName } = req.params;
-        console.log(`🆔 Fetching last record ID for table: ${tableName}`);
-
-        // Sort by recordId descending — works for both numeric and string IDs
-        // For numeric IDs stored as strings, we fetch all and sort in JS for accuracy
-        const totalCount = await Record.countDocuments({ tableName });
-
-        if (totalCount === 0) {
-            return res.json({ success: true, lastId: null, totalCount: 0 });
-        }
-
-        // Try numeric sort first (cast recordId to int in aggregation)
-        let lastRecord = null;
-        try {
-            const result = await Record.aggregate([
-                { $match: { tableName } },
-                {
-                    $addFields: {
-                        numericId: { $toInt: '$recordId' }
-                    }
-                },
-                { $sort: { numericId: -1 } },
-                { $limit: 1 }
-            ]);
-            lastRecord = result[0] || null;
-        } catch {
-            // recordId is not numeric — fall back to lexicographic sort
-            lastRecord = await Record.findOne({ tableName }).sort({ recordId: -1 }).lean();
-        }
-
+        // so the local server can extract whatever column it needs
+        const record = await Record.findOne({ tableName }).sort({ updatedAt: -1 }).lean();
         res.json({
             success: true,
-            lastId: lastRecord?.recordId || null,
-            totalCount
+            lastRecord: record?.data || null
         });
     } catch (error) {
-        console.error('Error fetching last ID:', error);
+        console.error('Error fetching last record:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
-
 
 
 
