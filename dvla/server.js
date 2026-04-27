@@ -73,7 +73,10 @@ app.get('/api/data/:tableName', async (req, res) => {
         const { tableName } = req.params;
         const { ids } = req.query;
 
-        console.log(`📊 Fetching data for table: ${tableName}${ids ? ` (filtered: ${ids.split(',').length} IDs)` : ''}`);
+        console.log(`📊 Fetching data for table: ${tableName}${ids ? ` (filtered: ${ids.split(',').length} IDs)` : ''}`);  
+
+
+
 
         // FIX #1: Support filtering by IDs via query param
         const query = { tableName };
@@ -102,39 +105,68 @@ app.get('/api/data/:tableName', async (req, res) => {
     }
 });
 
-// FIX #1: New POST endpoint to fetch records by IDs (avoids URL length limits)
-app.post('/api/data/:tableName/by-ids', async (req, res) => {
+
+// Get last record based on monitoringColumn + timestampColumn (or updatedAt fallback)
+app.get('/api/data/:tableName/last-id', async (req, res) => {
     try {
         const { tableName } = req.params;
-        const { ids } = req.body;
 
-        if (!ids || !Array.isArray(ids)) {
-            return res.status(400).json({ success: false, error: 'ids array is required in request body' });
+        // Load monitoring configuration
+        const monitoringConfig = await MonitoringConfig.findOne({ tableName }).lean();
+        
+        const monitoringColumn = monitoringConfig?.monitoringColumn;
+        const timestampColumn = monitoringConfig?.timestampColumn;   // e.g. "UpdateTime", "SyncTime", etc.
+
+        if (!monitoringColumn) {
+            return res.status(400).json({
+                success: false,
+                error: 'monitoringColumn not configured for this table'
+            });
         }
 
-        console.log(`📊 Fetching ${ids.length} records by ID for table: ${tableName}`);
+        // Determine which timestamp field to sort by
+        const sortField = timestampColumn && timestampColumn !== '' 
+            ? `data.${timestampColumn}` 
+            : 'updatedAt';
 
-        const records = await Record.find({
-            tableName,
-            recordId: { $in: ids.map(String) }
-        });
+        // Find the most recent record based on the timestamp
+        const lastRecord = await Record.findOne({ tableName })
+            .sort({ [sortField]: -1 })   // newest first
+            .lean();
+
+        if (!lastRecord) {
+            return res.json({
+                success: true,
+                lastId: null,
+                timestamp: null,
+                lastRecord: null
+            });
+        }
+
+        const lastIdValue = lastRecord.data?.[monitoringColumn];
+        const timestampValue = timestampColumn 
+            ? lastRecord.data?.[timestampColumn] 
+            : lastRecord.updatedAt;
+
+        console.log(`🆔 Last record for ${tableName} | MonitoringColumn: ${monitoringColumn} = ${lastIdValue} | Timestamp: ${timestampValue}`);
 
         res.json({
             success: true,
-            tableName,
-            count: records.length,
-            records: records.map(r => ({
-                ...r.data,
-                _syncMeta: { hash: r.hash, updatedAt: r.updatedAt }
-            })),
-            // Also return hash map so local server can compare without re-hashing
-            hashMap: Object.fromEntries(records.map(r => [r.recordId, r.hash]))
+            lastId: lastIdValue != null ? String(lastIdValue) : null,
+            timestamp: timestampValue,
+            monitoringColumn,
+            timestampColumn: timestampColumn || 'updatedAt',
+            lastRecord: lastRecord.data   // full record so local server can extract anything
         });
+
     } catch (error) {
-        console.error('Error fetching records by IDs:', error);
-        res.status(500).json({ success: false, error: error.message });
+        console.error('Error fetching last-id:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
     }
-}); 
+});
 
 
 // Get today's data for a table
