@@ -301,6 +301,8 @@ app.get('/api/stats/:tableName', async (req, res) => {
 
         const TableIdAndTimestamp = await getTableLastIdAndTimestamp(tableName);
 
+        console.log(`Stats for ${tableName} | Total: ${totalCount} | Today: ${todayCount} | Last 7 Days: ${weekCount} | Last 30 Days: ${monthCount} | LastId: ${TableIdAndTimestamp.lastId} | Timestamp: ${TableIdAndTimestamp.timestamp}`); 
+
         res.json({
             success: true,
             tableName,
