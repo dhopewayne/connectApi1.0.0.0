@@ -299,9 +299,9 @@ app.get('/api/stats/:tableName', async (req, res) => {
         const monthCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastMonth } });   
 
 
-        const TableIdAndTimestamp = await getTableLastIdAndTimestamp(tableName);
+        // const TableIdAndTimestamp = await getTableLastIdAndTimestamp(tableName);
 
-        console.log(`Stats for ${tableName} | Total: ${totalCount} | Today: ${todayCount} | Last 7 Days: ${weekCount} | Last 30 Days: ${monthCount} | LastId: ${TableIdAndTimestamp.lastId} | Timestamp: ${TableIdAndTimestamp.timestamp}`); 
+        // console.log(`Stats for ${tableName} | Total: ${totalCount} | Today: ${todayCount} | Last 7 Days: ${weekCount} | Last 30 Days: ${monthCount} | LastId: ${TableIdAndTimestamp.lastId} | Timestamp: ${TableIdAndTimestamp.timestamp}`); 
 
         res.json({
             success: true,
@@ -364,7 +364,7 @@ app.post('/api/sync/changes', async (req, res) => {
                         { upsert: true, new: true }
                     );
                     results.added++;
-                    console.log(`  ✅ Added: ${recordId}`);
+                    // console.log(`  ✅ Added: ${recordId}`);
                 } catch (error) {
                     console.error(`  ❌ Failed to add:`, error.message);
                     results.errors++;
