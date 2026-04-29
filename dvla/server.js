@@ -297,11 +297,14 @@ app.get('/api/stats/:tableName', async (req, res) => {
         const lastMonth = new Date();
         lastMonth.setMonth(lastMonth.getMonth() - 1);
         const monthCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastMonth } });   
+ 
+
+        const TableIdAndTimestamp = await getTableLastIdAndTimestamp(tableName);  
 
 
-        // const TableIdAndTimestamp = await getTableLastIdAndTimestamp(tableName);
+        console.log('tableId and timestamp response '  ,  TableIdAndTimestamp);
 
-        // console.log(`Stats for ${tableName} | Total: ${totalCount} | Today: ${todayCount} | Last 7 Days: ${weekCount} | Last 30 Days: ${monthCount} | LastId: ${TableIdAndTimestamp.lastId} | Timestamp: ${TableIdAndTimestamp.timestamp}`); 
+        console.log(`Stats for ${tableName} | Total: ${totalCount} | Today: ${todayCount} | Last 7 Days: ${weekCount} | Last 30 Days: ${monthCount} | LastId: ${TableIdAndTimestamp.lastId} | Timestamp: ${TableIdAndTimestamp.timestamp}`); 
 
         res.json({
             success: true,
