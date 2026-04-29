@@ -23,7 +23,17 @@ const recordSchema = new mongoose.Schema({
     hash: { type: String },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
-});
+});  
+
+
+const monitoringConfigSchema = new mongoose.Schema({
+    tableName: { type: String, required: true, unique: true },
+    monitoringColumn: { type: String, required: true },
+    timestampColumn: String,
+    updatedAt: { type: Date, default: Date.now }
+}); 
+
+const MonitoringConfig = mongoose.model('MonitoringConfig', monitoringConfigSchema);
 
 recordSchema.index({ tableName: 1, recordId: 1 }, { unique: true });
 recordSchema.index({ createdAt: 1 });
