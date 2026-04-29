@@ -460,23 +460,36 @@ app.post('/api/sync/changes', async (req, res) => {
 });  
  
 
- 
-app.get('/api/data/:tableName/last-id', async (req, res) => {
+
+
+// Get records by IDs called by local server's fetchRemoteRecordsMap
+app.post('/api/data/:tableName/by-ids', async (req, res) => {
     try {
         const { tableName } = req.params;
-        // so the local server can extract whatever column it needs
-        const record = await Record.findOne({ tableName }).sort({ updatedAt: -1 }).lean();
+        const { ids } = req.body;
+
+        if (!ids || !Array.isArray(ids)) {
+            return res.status(400).json({ success: false, error: 'ids array is required' });
+        }
+
+        const records = await Record.find({
+            tableName,
+            recordId: { $in: ids.map(String) }
+        }).lean();
+
         res.json({
             success: true,
-            lastRecord: record?.data || null
+            tableName,
+            count: records.length,
+            records: records.map(r => r.data)
         });
     } catch (error) {
-        console.error('Error fetching last record:', error);
+        console.error('Error fetching records by IDs:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-
+ 
 
 // Health check
 app.get('/health', (req, res) => {
