@@ -3,6 +3,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const crypto = require('crypto');
+const { table } = require('console');
 require('dotenv').config();
 
 const app = express();
@@ -104,6 +105,28 @@ app.get('/api/data/:tableName', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+
+
+async function getTableLastIdAndTimestamp(tableName) { 
+    const monitoringConfig = await MonitoringConfig.findOne({ tableName }).lean();
+    const monitoringColumn = monitoringConfig?.monitoringColumn;
+    const timestampColumn = monitoringConfig?.timestampColumn;   // e.g. "UpdateTime", "SyncTime", etc.
+    if (!monitoringColumn) {
+        throw new Error('monitoringColumn not configured for this table');
+    }
+
+    const sortField = timestampColumn && timestampColumn !== '' ? `data.${timestampColumn}` : 'updatedAt';
+    const lastRecord = await Record.findOne({ tableName }).sort({ [sortField]: -1 }).lean();
+    if (!lastRecord) {
+        return { lastId: null, timestamp: null };
+    }
+    const lastIdValue = lastRecord.data?.[monitoringColumn];
+    const timestampValue = timestampColumn
+        ? lastRecord.data?.[timestampColumn]
+        : lastRecord.updatedAt;
+    return { lastId: lastIdValue != null ? String(lastIdValue) : null, timestamp: timestampValue };
+}
 
 
 // Get last record based on monitoringColumn + timestampColumn (or updatedAt fallback)
@@ -273,7 +296,10 @@ app.get('/api/stats/:tableName', async (req, res) => {
 
         const lastMonth = new Date();
         lastMonth.setMonth(lastMonth.getMonth() - 1);
-        const monthCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastMonth } });
+        const monthCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastMonth } });   
+
+
+        const TableIdAndTimestamp = await getTableLastIdAndTimestamp(tableName);
 
         res.json({
             success: true,
@@ -282,8 +308,9 @@ app.get('/api/stats/:tableName', async (req, res) => {
                 total: totalCount,
                 today: todayCount,
                 last7Days: weekCount,
-                last30Days: monthCount
-            },
+                last30Days: monthCount  
+            }, 
+            tableIdAndTimestamp: TableIdAndTimestamp, 
             lastUpdated: new Date()
         });
     } catch (error) {
@@ -418,7 +445,7 @@ app.post('/api/sync/changes', async (req, res) => {
 });  
  
 
-
+ 
 app.get('/api/data/:tableName/last-id', async (req, res) => {
     try {
         const { tableName } = req.params;
@@ -461,4 +488,6 @@ app.listen(PORT, () => {
     💚 Health:            GET  /health
     ════════════════════════════════════════════════════
     `);
-});
+}); 
+
+
