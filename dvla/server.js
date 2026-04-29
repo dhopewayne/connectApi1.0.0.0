@@ -29,7 +29,7 @@ const recordSchema = new mongoose.Schema({
 const monitoringConfigSchema = new mongoose.Schema({
     tableName: { type: String, required: true, unique: true },
     monitoringColumn: { type: String, required: true },
-    timestampColumn: String,
+    timestampColumn: { type: String, default: '' }  ,   
     updatedAt: { type: Date, default: Date.now }
 }); 
 
