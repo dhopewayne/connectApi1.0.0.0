@@ -8,7 +8,7 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "async_hooks": "^1.0.0",  
+    "async_hooks": "^1.0.0",
     "socket.io": "^4.8.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
