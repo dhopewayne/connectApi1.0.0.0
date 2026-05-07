@@ -1,521 +1,494 @@
-// remote-server.js
 const express = require('express');
-const mongoose = require('mongoose');
 const cors = require('cors');
-const crypto = require('crypto');
-const { table } = require('console');
+const http = require('http');
+const socketIo = require('socket.io');
 require('dotenv').config();
 
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+    cors: { origin: '*', methods: ['GET', 'POST'] },
+    pingTimeout: 60000,
+    pingInterval: 25000
+});
+
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// ============= MIDDLEWARE =============
 app.use(express.json({ limit: '50mb' }));
 app.use(cors());
+app.use(express.static('public'));
 
-// ============= SCHEMA AND MODEL =============
-// FIX #1 (from prior review): Schema defined BEFORE model creation
+// ============= STORAGE FOR RECEIVED DATA =============
+let latestData = {
+    records: [],
+    lastUpdate: null,
+    source: null,
+    table: null,
+    count: 0
+};
 
-const recordSchema = new mongoose.Schema({
-    tableName: { type: String, required: true, index: true },
-    recordId: { type: String, required: true },
-    data: { type: mongoose.Schema.Types.Mixed, required: true },
-    hash: { type: String },
-    createdAt: { type: Date, default: Date.now },
-    updatedAt: { type: Date, default: Date.now }
-});  
+let dataHistory = [];
+const MAX_HISTORY = 100;
+let connectedBranchClients = new Map();
 
-
-const monitoringConfigSchema = new mongoose.Schema({
-    tableName: { type: String, required: true, unique: true },
-    monitoringColumn: { type: String, required: true },
-    timestampColumn: { type: String, default: '' }  ,   
-    updatedAt: { type: Date, default: Date.now }
-}); 
-
-const MonitoringConfig = mongoose.model('MonitoringConfig', monitoringConfigSchema);
-
-recordSchema.index({ tableName: 1, recordId: 1 }, { unique: true });
-recordSchema.index({ createdAt: 1 });
-recordSchema.index({ updatedAt: 1 });
-
-const Record = mongoose.model('Record', recordSchema);
-
-// ============= MONGODB CONNECTION =============
-
-const MONGODB_URI = process.env.MONGODB_URI;
-
-mongoose.connect(MONGODB_URI)
-    .then(() => console.log('✅ Connected to MongoDB'))
-    .catch(err => {
-        console.error('❌ MongoDB connection error:', err.message);
-        process.exit(1);
-    });
-
-// ============= HELPERS =============
-
-function generateHash(record) {
-    const sortedRecord = {};
-    Object.keys(record).sort().forEach(key => {
-        sortedRecord[key] = record[key];
-    });
-    return crypto.createHash('md5').update(JSON.stringify(sortedRecord)).digest('hex');
-}
-
-function getRecordId(record) {
-    if (record.id !== undefined && record.id !== null) return String(record.id);
-    if (record.ID !== undefined && record.ID !== null) return String(record.ID);
-    if (record.AUTOID !== undefined && record.AUTOID !== null) return String(record.AUTOID);
-
-    const idFields = ['Id', '_id', 'recordId', 'RecordId', 'rowId', 'RowId'];
-    for (const field of idFields) {
-        if (record[field] !== undefined && record[field] !== null) {
-            return String(record[field]);
-        }
+// ============= LOGGING MIDDLEWARE =============
+app.use((req, res, next) => {
+    console.log(`\n🔵 [${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+    if (Object.keys(req.query).length > 0) {
+        console.log(`   Query:`, req.query);
     }
-    return null;
-}
-
-// ============= API ENDPOINTS =============
-
-// Get all data for a table (with optional ?ids= filter)
-app.get('/api/data/:tableName', async (req, res) => {
-    try {
-        const { tableName } = req.params;
-        const { ids } = req.query;
-
-        console.log(`📊 Fetching data for table: ${tableName}${ids ? ` (filtered: ${ids.split(',').length} IDs)` : ''}`);  
-
-
-
-
-        // FIX #1: Support filtering by IDs via query param
-        const query = { tableName };
-        if (ids) {
-            const idArray = ids.split(',').map(id => id.trim()).filter(Boolean);
-            if (idArray.length > 0) {
-                query.recordId = { $in: idArray };
-            }
-        }
-
-        const records = await Record.find(query).sort({ createdAt: -1 });
-
-        res.json({
-            success: true,
-            tableName,
-            count: records.length,
-            records: records.map(r => r.data),
-            metadata: {
-                lastUpdated: records.length > 0 ? records[0].updatedAt : null,
-                totalRecords: records.length
-            }
-        });
-    } catch (error) {
-        console.error('Error fetching data:', error);
-        res.status(500).json({ success: false, error: error.message });
+    if (req.body && Object.keys(req.body).length > 0) {
+        const safeBody = { ...req.body };
+        if (safeBody.records) safeBody.records = `${safeBody.records.length} records`;
+        console.log(`   Body:`, safeBody);
     }
+    next();
 });
 
-
-
-async function getTableLastIdAndTimestamp(tableName) { 
-    const monitoringConfig = await MonitoringConfig.findOne({ tableName }).lean();
-    const monitoringColumn = monitoringConfig?.monitoringColumn;
-    const timestampColumn = monitoringConfig?.timestampColumn;   // e.g. "UpdateTime", "SyncTime", etc.
-    if (!monitoringColumn) {
-        throw new Error('monitoringColumn not configured for this table');
+// ============= REAL-TIME DATA ENDPOINT (Receives from local server) =============
+app.post('/realtimedata', async (req, res) => {
+    const { timestamp, records, count, source, table } = req.body;
+    const sourceSecret = req.headers['x-source-secret'];
+    const expectedSecret = process.env.REMOTE_SECRET;
+    
+    console.log(`\n📡 REAL-TIME DATA RECEIVED at ${new Date().toISOString()}`);
+    console.log(`   Source: ${source || 'local_server'}`);
+    console.log(`   Table: ${table || 'unknown'}`);
+    console.log(`   Records: ${count || records?.length || 0}`);
+    console.log(`   Timestamp: ${timestamp}`);
+    
+    // Verify secret if configured
+    if (expectedSecret && sourceSecret !== expectedSecret) {
+        console.log(`❌ Invalid secret received`);
+        return res.status(401).json({ error: 'Invalid secret' });
     }
-
-    const sortField = timestampColumn && timestampColumn !== '' ? `data.${timestampColumn}` : 'updatedAt';
-    const lastRecord = await Record.findOne({ tableName }).sort({ [sortField]: -1 }).lean();
-    if (!lastRecord) {
-        return { lastId: null, timestamp: null };
+    
+    if (!records || records.length === 0) {
+        console.log(`⚠️ No records received`);
+        return res.json({ success: true, message: 'No data to process' });
     }
-    const lastIdValue = lastRecord.data?.[monitoringColumn];
-    const timestampValue = timestampColumn
-        ? lastRecord.data?.[timestampColumn]
-        : lastRecord.updatedAt;
-    return { lastId: lastIdValue != null ? String(lastIdValue) : null, timestamp: timestampValue };
-}
+    
+    // Store the latest data
+    latestData = {
+        records: records,
+        lastUpdate: new Date().toISOString(),
+        source: source || 'local_server',
+        table: table || 'unknown',
+        count: records.length,
+        receivedAt: timestamp
+    };
+    
+    // Add to history
+    dataHistory.unshift({
+        ...latestData,
+        id: Date.now()
+    });
+    
+    // Keep only last MAX_HISTORY entries
+    if (dataHistory.length > MAX_HISTORY) {
+        dataHistory.pop();
+    }
+    
+    console.log(`✅ Data stored: ${records.length} records`);
+    console.log(`   Current history size: ${dataHistory.length}`);
+    
+    // Broadcast to all connected branch clients via WebSocket
+    const broadcastPayload = {
+        type: 'live_update',
+        timestamp: new Date().toISOString(),
+        records: records,
+        count: records.length,
+        source: source,
+        table: table
+    };
+    
+    let clientsNotified = 0;
+    for (const [clientId, clientSocket] of connectedBranchClients) {
+        clientSocket.emit('data_update', broadcastPayload);
+        clientsNotified++;
+    }
+    
+    console.log(`📢 Broadcast to ${clientsNotified} connected branch clients`);
+    
+    res.json({ 
+        success: true, 
+        received: records.length,
+        stored: true,
+        clientsNotified,
+        timestamp: new Date().toISOString()
+    });
+});
 
+// ============= ENDPOINTS FOR BRANCH OFFICES =============
 
-// Get last record based on monitoringColumn + timestampColumn (or updatedAt fallback)
-app.get('/api/data/:tableName/last-id', async (req, res) => {
-    try {
-        const { tableName } = req.params;
-
-        // Load monitoring configuration
-        const monitoringConfig = await MonitoringConfig.findOne({ tableName }).lean();
-        
-        const monitoringColumn = monitoringConfig?.monitoringColumn;
-        const timestampColumn = monitoringConfig?.timestampColumn;   // e.g. "UpdateTime", "SyncTime", etc.
-
-        if (!monitoringColumn) {
-            return res.status(400).json({
-                success: false,
-                error: 'monitoringColumn not configured for this table'
-            });
-        }
-
-        // Determine which timestamp field to sort by
-        const sortField = timestampColumn && timestampColumn !== '' 
-            ? `data.${timestampColumn}` 
-            : 'updatedAt';
-
-        // Find the most recent record based on the timestamp
-        const lastRecord = await Record.findOne({ tableName })
-            .sort({ [sortField]: -1 })   // newest first
-            .lean();
-
-        if (!lastRecord) {
-            return res.json({
-                success: true,
-                lastId: null,
-                timestamp: null,
-                lastRecord: null
-            });
-        }
-
-        const lastIdValue = lastRecord.data?.[monitoringColumn];
-        const timestampValue = timestampColumn 
-            ? lastRecord.data?.[timestampColumn] 
-            : lastRecord.updatedAt;
-
-        console.log(`🆔 Last record for ${tableName} | MonitoringColumn: ${monitoringColumn} = ${lastIdValue} | Timestamp: ${timestampValue}`);
-
-        res.json({
-            success: true,
-            lastId: lastIdValue != null ? String(lastIdValue) : null,
-            timestamp: timestampValue,
-            monitoringColumn,
-            timestampColumn: timestampColumn || 'updatedAt',
-            lastRecord: lastRecord.data   // full record so local server can extract anything
-        });
-
-    } catch (error) {
-        console.error('Error fetching last-id:', error);
-        res.status(500).json({ 
+// Get all current data (full dataset)
+app.get('/api/data/all', async (req, res) => {
+    console.log(`🎯 [BRANCH] GET /api/data/all`);
+    
+    if (!latestData.records || latestData.records.length === 0) {
+        return res.status(404).json({ 
             success: false, 
-            error: error.message 
+            message: 'No data available yet. Waiting for local server to send data.',
+            records: [],
+            count: 0
         });
     }
+    
+    res.json({
+        success: true,
+        records: latestData.records,
+        count: latestData.count,
+        lastUpdate: latestData.lastUpdate,
+        source: latestData.source,
+        table: latestData.table
+    });
 });
 
-
-// Get today's data for a table
-app.get('/api/data/today/:tableName', async (req, res) => {
-    try {
-        const { tableName } = req.params;
-        console.log(`📅 Fetching today's data for table: ${tableName}`);
-
-        const startOfDay = new Date();
-        startOfDay.setHours(0, 0, 0, 0);
-        const endOfDay = new Date();
-        endOfDay.setHours(23, 59, 59, 999);
-
-        const records = await Record.find({
-            tableName,
-            createdAt: { $gte: startOfDay, $lte: endOfDay }
-        }).sort({ createdAt: -1 });
-
-        res.json({
+// Get paginated data
+app.get('/api/data/page', async (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = Math.min(parseInt(req.query.pageSize) || 100, 1000);
+    const startIndex = (page - 1) * pageSize;
+    const endIndex = startIndex + pageSize;
+    
+    console.log(`🎯 [BRANCH] GET /api/data/page - Page ${page}, Size ${pageSize}`);
+    
+    if (!latestData.records || latestData.records.length === 0) {
+        return res.json({
             success: true,
-            tableName,
-            date: startOfDay,
-            count: records.length,
-            records: records.map(r => r.data),
-            metadata: { startOfDay, endOfDay, totalRecords: records.length }
+            records: [],
+            total: 0,
+            page,
+            pageSize,
+            totalPages: 0,
+            message: 'No data available yet'
         });
-    } catch (error) {
-        console.error("Error fetching today's data:", error);
-        res.status(500).json({ success: false, error: error.message });
     }
+    
+    const paginatedRecords = latestData.records.slice(startIndex, endIndex);
+    
+    res.json({
+        success: true,
+        records: paginatedRecords,
+        total: latestData.count,
+        page,
+        pageSize,
+        totalPages: Math.ceil(latestData.count / pageSize),
+        lastUpdate: latestData.lastUpdate
+    });
 });
 
-// Get data by date range
-app.get('/api/data/range/:tableName', async (req, res) => {
-    try {
-        const { tableName } = req.params;
-        const { startDate, endDate } = req.query;
-
-        if (!startDate || !endDate) {
-            return res.status(400).json({ success: false, error: 'startDate and endDate are required' });
-        }
-
-        const start = new Date(startDate);
-        const end = new Date(endDate);
-        end.setHours(23, 59, 59, 999);
-
-        const records = await Record.find({
-            tableName,
-            createdAt: { $gte: start, $lte: end }
-        }).sort({ createdAt: -1 });
-
-        res.json({
+// Search/filter records
+app.post('/api/data/search', async (req, res) => {
+    const { filters = {}, searchTerm = null } = req.body;
+    
+    console.log(`🎯 [BRANCH] POST /api/data/search`);
+    console.log(`   Filters:`, filters);
+    if (searchTerm) console.log(`   Search term: ${searchTerm}`);
+    
+    if (!latestData.records || latestData.records.length === 0) {
+        return res.json({
             success: true,
-            tableName,
-            startDate: start,
-            endDate: end,
-            count: records.length,
-            records: records.map(r => r.data)
+            records: [],
+            count: 0,
+            message: 'No data available'
         });
-    } catch (error) {
-        console.error('Error fetching date range data:', error);
-        res.status(500).json({ success: false, error: error.message });
     }
-});
-
-// Get single record by ID
-app.get('/api/data/:tableName/:recordId', async (req, res) => {
-    try {
-        const { tableName, recordId } = req.params;
-        console.log(`🔍 Fetching record ${recordId} from ${tableName}`);
-
-        const record = await Record.findOne({ tableName, recordId });
-
-        if (!record) {
-            return res.status(404).json({ success: false, error: 'Record not found' });
-        }
-
-        res.json({
-            success: true,
-            record: record.data,
-            metadata: { createdAt: record.createdAt, updatedAt: record.updatedAt }
+    
+    let filteredRecords = [...latestData.records];
+    
+    // Apply search term across all fields
+    if (searchTerm) {
+        const term = searchTerm.toLowerCase();
+        filteredRecords = filteredRecords.filter(record => {
+            return Object.values(record).some(value => 
+                String(value).toLowerCase().includes(term)
+            );
         });
-    } catch (error) {
-        console.error('Error fetching record:', error);
-        res.status(500).json({ success: false, error: error.message });
     }
-});
-
-// Get table statistics
-app.get('/api/stats/:tableName', async (req, res) => {
-    try {
-        const { tableName } = req.params;
-        console.log(`📈 Fetching stats for table: ${tableName}`);
-
-        const totalCount = await Record.countDocuments({ tableName });
-
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const todayCount = await Record.countDocuments({ tableName, createdAt: { $gte: today } });
-
-        const lastWeek = new Date();
-        lastWeek.setDate(lastWeek.getDate() - 7);
-        const weekCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastWeek } });
-
-        const lastMonth = new Date();
-        lastMonth.setMonth(lastMonth.getMonth() - 1);
-        const monthCount = await Record.countDocuments({ tableName, createdAt: { $gte: lastMonth } });   
- 
-
-        const TableIdAndTimestamp = await getTableLastIdAndTimestamp(tableName);  
-
-
-        console.log('tableId and timestamp response '  ,  TableIdAndTimestamp);
-
-        console.log(`Stats for ${tableName} | Total: ${totalCount} | Today: ${todayCount} | Last 7 Days: ${weekCount} | Last 30 Days: ${monthCount} | LastId: ${TableIdAndTimestamp.lastId} | Timestamp: ${TableIdAndTimestamp.timestamp}`); 
-
-        res.json({
-            success: true,
-            tableName,
-            stats: {
-                total: totalCount,
-                today: todayCount,
-                last7Days: weekCount,
-                last30Days: monthCount  
-            }, 
-            tableIdAndTimestamp: TableIdAndTimestamp, 
-            lastUpdated: new Date()
-        });
-    } catch (error) {
-        console.error('Error fetching stats:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Receive and process sync changes from local server
-app.post('/api/sync/changes', async (req, res) => {
-    try {
-        const { tableName, changes } = req.body;
-
-        console.log(`\n════════════════════════════════════════════`);
-        console.log(`📥 SYNC CHANGES RECEIVED`);
-        console.log(`Table: ${tableName}`);
-        console.log(`Added: ${changes.added?.length || 0}`);
-        console.log(`Updated: ${changes.updated?.length || 0}`);
-        console.log(`Deleted: ${changes.deleted?.length || 0}`);
-
-        if (!tableName || !changes) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid request: tableName and changes required'
+    
+    // Apply specific field filters
+    if (filters && Object.keys(filters).length > 0) {
+        filteredRecords = filteredRecords.filter(record => {
+            return Object.entries(filters).every(([key, value]) => {
+                return String(record[key]).toLowerCase() === String(value).toLowerCase();
             });
-        }
-
-        const results = { added: 0, updated: 0, deleted: 0, errors: 0, ignored: 0 };
-
-        // Process added records
-        if (changes.added && Array.isArray(changes.added)) {
-            for (const record of changes.added) {
-                try {
-                    const recordId = getRecordId(record);
-                    if (!recordId) {
-                        console.log(`  ⚠️ Could not extract ID from added record`);
-                        results.errors++;
-                        continue;
-                    }
-                    await Record.findOneAndUpdate(
-                        { tableName, recordId },
-                        {
-                            tableName,
-                            recordId,
-                            data: record,
-                            hash: generateHash(record),
-                            updatedAt: new Date()
-                        },
-                        { upsert: true, new: true }
-                    );
-                    results.added++;
-                    // console.log(`  ✅ Added: ${recordId}`);
-                } catch (error) {
-                    console.error(`  ❌ Failed to add:`, error.message);
-                    results.errors++;
-                }
-            }
-        }
-
-        // Process updated records
-        // Local server sends plain records (not {old, new}) — pushChangesInBatches handles this
-        if (changes.updated && Array.isArray(changes.updated)) {
-            for (const updateItem of changes.updated) {
-                try {
-                    // Handle both formats defensively: plain record or {old, new}
-                    const record = updateItem.new !== undefined ? updateItem.new : updateItem;
-
-                    const recordId = getRecordId(record);
-                    if (!recordId) {
-                        console.log(`  ⚠️ Could not extract ID from updated record`);
-                        results.errors++;
-                        continue;
-                    }
-
-                    await Record.findOneAndUpdate(
-                        { tableName, recordId },
-                        {
-                            tableName,
-                            recordId,
-                            data: record,
-                            hash: generateHash(record),
-                            updatedAt: new Date()
-                        },
-                        { upsert: true, new: true }
-                    );
-                    results.updated++;
-                    console.log(`  ✅ Updated: ${recordId}`);
-                } catch (error) {
-                    console.error(`  ❌ Failed to update:`, error.message);
-                    results.errors++;
-                }
-            }
-        }
-
-        // Process deleted records
-        if (changes.deleted && Array.isArray(changes.deleted)) {
-            for (const record of changes.deleted) {
-                try {
-                    const recordId = getRecordId(record);
-                    if (!recordId) {
-                        console.log(`  ⚠️ Could not extract ID from deleted record`);
-                        results.errors++;
-                        continue;
-                    }
-                    await Record.deleteOne({ tableName, recordId });
-                    results.deleted++;
-                    console.log(`  ✅ Deleted: ${recordId}`);
-                } catch (error) {
-                    console.error(`  ❌ Failed to delete:`, error.message);
-                    results.errors++;
-                }
-            }
-        }
-
-        const totalRecords = await Record.countDocuments({ tableName });
-
-        console.log(`✅ Sync results: +${results.added} ~${results.updated} -${results.deleted} ✗${results.errors}`);
-        console.log(`   Total records in remote DB: ${totalRecords}`);
-        console.log(`════════════════════════════════════════════\n`);
-
-        res.json({
-            success: true,
-            message: 'Changes synced successfully',
-            stats: results,
-            totalRecords
         });
-
-    } catch (error) {
-        console.error('❌ Sync error:', error);
-        res.status(500).json({ success: false, error: error.message });
     }
-});  
- 
-
-
-
-// Get records by IDs called by local server's fetchRemoteRecordsMap
-app.post('/api/data/:tableName/by-ids', async (req, res) => {
-    try {
-        const { tableName } = req.params;
-        const { ids } = req.body;
-
-        if (!ids || !Array.isArray(ids)) {
-            return res.status(400).json({ success: false, error: 'ids array is required' });
-        }
-
-        const records = await Record.find({
-            tableName,
-            recordId: { $in: ids.map(String) }
-        }).lean();
-
-        res.json({
-            success: true,
-            tableName,
-            count: records.length,
-            records: records.map(r => r.data)
-        });
-    } catch (error) {
-        console.error('Error fetching records by IDs:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
+    
+    console.log(`✅ Found ${filteredRecords.length} matching records`);
+    
+    res.json({
+        success: true,
+        records: filteredRecords,
+        count: filteredRecords.length,
+        total: latestData.count,
+        filters: filters,
+        searchTerm: searchTerm || null,
+        lastUpdate: latestData.lastUpdate
+    });
 });
 
- 
+// Get data history (last N updates)
+app.get('/api/data/history', async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    
+    console.log(`🎯 [BRANCH] GET /api/data/history - Limit: ${limit}`);
+    
+    res.json({
+        success: true,
+        history: dataHistory.slice(0, limit),
+        totalHistory: dataHistory.length,
+        currentData: {
+            records: latestData.count,
+            lastUpdate: latestData.lastUpdate
+        }
+    });
+});
+
+// Get data summary/stats
+app.get('/api/data/summary', async (req, res) => {
+    console.log(`🎯 [BRANCH] GET /api/data/summary`);
+    
+    if (!latestData.records || latestData.records.length === 0) {
+        return res.json({
+            success: true,
+            hasData: false,
+            message: 'No data available yet'
+        });
+    }
+    
+    // Get column names from first record
+    const columns = Object.keys(latestData.records[0] || {});
+    
+    // Get unique values for each column (sample)
+    const sampleValues = {};
+    columns.forEach(col => {
+        const uniqueValues = new Set();
+        latestData.records.slice(0, 100).forEach(record => {
+            if (record[col]) uniqueValues.add(String(record[col]));
+        });
+        sampleValues[col] = Array.from(uniqueValues).slice(0, 10);
+    });
+    
+    res.json({
+        success: true,
+        hasData: true,
+        stats: {
+            totalRecords: latestData.count,
+            columns: columns,
+            columnCount: columns.length,
+            lastUpdate: latestData.lastUpdate,
+            source: latestData.source,
+            table: latestData.table
+        },
+        sampleValues: sampleValues,
+        firstRecord: latestData.records[0],
+        lastRecord: latestData.records[latestData.records.length - 1]
+    });
+});
+
+// Export data as JSON
+app.get('/api/data/export', async (req, res) => {
+    console.log(`🎯 [BRANCH] GET /api/data/export`);
+    
+    if (!latestData.records || latestData.records.length === 0) {
+        return res.status(404).json({ error: 'No data available' });
+    }
+    
+    const format = req.query.format || 'json';
+    
+    if (format === 'json') {
+        res.json({
+            exportedAt: new Date().toISOString(),
+            source: latestData.source,
+            table: latestData.table,
+            totalRecords: latestData.count,
+            data: latestData.records
+        });
+    } else {
+        res.status(400).json({ error: 'Format not supported. Use format=json' });
+    }
+});
 
 // Health check
-app.get('/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
     res.json({
-        status: 'healthy',
-        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-        timestamp: new Date()
+        status: 'online',
+        hasData: latestData.records.length > 0,
+        recordCount: latestData.count,
+        lastUpdate: latestData.lastUpdate,
+        connectedClients: connectedBranchClients.size,
+        historySize: dataHistory.length,
+        timestamp: new Date().toISOString()
     });
+});
+
+// Get server info
+app.get('/api/info', async (req, res) => {
+    res.json({
+        name: 'Remote Data Proxy Server',
+        version: '1.0.0',
+        endpoints: [
+            'POST /realtimedata - Receive data from local server',
+            'GET /api/data/all - Get all current data',
+            'GET /api/data/page - Get paginated data',
+            'POST /api/data/search - Search/filter records',
+            'GET /api/data/history - Get update history',
+            'GET /api/data/summary - Get data summary',
+            'GET /api/data/export - Export data as JSON',
+            'GET /api/health - Health check',
+            'GET /api/stats - Real-time statistics',
+            'WS / - WebSocket for real-time updates'
+        ],
+        config: {
+            maxHistory: MAX_HISTORY,
+            requiresAuth: !!process.env.REMOTE_SECRET
+        }
+    });
+});
+
+// Real-time statistics endpoint
+app.get('/api/stats', async (req, res) => {
+    const stats = {
+        currentData: {
+            recordCount: latestData.count,
+            lastUpdate: latestData.lastUpdate,
+            source: latestData.source,
+            table: latestData.table
+        },
+        connectionStats: {
+            activeBranchClients: connectedBranchClients.size,
+            totalUpdatesReceived: dataHistory.length
+        },
+        serverTime: new Date().toISOString(),
+        uptime: process.uptime()
+    };
+    
+    // Calculate update frequency
+    if (dataHistory.length >= 2) {
+        const lastTwo = dataHistory.slice(0, 2);
+        const timeDiff = new Date(lastTwo[0].lastUpdate) - new Date(lastTwo[1].lastUpdate);
+        stats.updateFrequency = `${Math.round(timeDiff / 1000)} seconds between updates`;
+    }
+    
+    res.json(stats);
+});
+
+// ============= WEBSOCKET FOR BRANCH CLIENTS =============
+io.on('connection', (socket) => {
+    const clientId = socket.id;
+    const clientIp = socket.handshake.address;
+    
+    console.log(`🏢 BRANCH CLIENT CONNECTED: ${clientId} from ${clientIp}`);
+    connectedBranchClients.set(clientId, socket);
+    
+    // Send current data immediately on connection
+    if (latestData.records && latestData.records.length > 0) {
+        socket.emit('connected', {
+            message: 'Connected to remote data proxy',
+            currentData: {
+                count: latestData.count,
+                lastUpdate: latestData.lastUpdate,
+                hasData: true
+            }
+        });
+        
+        // Send the latest data
+        socket.emit('data_update', {
+            type: 'initial',
+            timestamp: new Date().toISOString(),
+            records: latestData.records,
+            count: latestData.count,
+            source: latestData.source,
+            table: latestData.table
+        });
+        
+        console.log(`📤 Sent initial data (${latestData.count} records) to ${clientId}`);
+    } else {
+        socket.emit('connected', {
+            message: 'Connected to remote data proxy - waiting for data from local server',
+            currentData: {
+                hasData: false
+            }
+        });
+    }
+    
+    // Handle subscription to specific filters
+    socket.on('subscribe', (filters = {}) => {
+        console.log(`📺 Client ${clientId} subscribed with filters:`, filters);
+        socket.filters = filters;
+        socket.emit('subscribed', { filters, timestamp: new Date().toISOString() });
+    });
+    
+    // Handle request for filtered data
+    socket.on('request_filtered', async (filters) => {
+        console.log(`🔍 Client ${clientId} requesting filtered data:`, filters);
+        
+        if (!latestData.records) {
+            socket.emit('filtered_data', { records: [], count: 0 });
+            return;
+        }
+        
+        const filtered = latestData.records.filter(record => {
+            return Object.entries(filters).every(([key, value]) => {
+                return String(record[key]).toLowerCase().includes(String(value).toLowerCase());
+            });
+        });
+        
+        socket.emit('filtered_data', {
+            records: filtered,
+            count: filtered.length,
+            filters,
+            timestamp: new Date().toISOString()
+        });
+    });
+    
+    // Handle ping/pong for connection health
+    socket.on('ping', () => {
+        socket.emit('pong', { timestamp: new Date().toISOString() });
+    });
+    
+    socket.on('disconnect', () => {
+        console.log(`🏢 BRANCH CLIENT DISCONNECTED: ${clientId}`);
+        connectedBranchClients.delete(clientId);
+    });
+});
+
+// ============= DASHBOARD =============
+app.get('/', (req, res) => {
+    res.sendFile(__dirname + '/public/remote-dashboard.html');
+});
+
+app.get('/dashboard', (req, res) => {
+    res.sendFile(__dirname + '/public/remote-dashboard.html');
 });
 
 // ============= START SERVER =============
-
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log(`
-    ════════════════════════════════════════════════════
-    🚀 Remote Data Server is running!
-    ════════════════════════════════════════════════════
-    📡 Server URL: http://localhost:${PORT}
-    📊 Get All Data:      GET  /api/data/:tableName
-    🔍 Get By IDs:        POST /api/data/:tableName/by-ids
-    📅 Get Today's Data:  GET  /api/data/today/:tableName
-    📈 Get Stats:         GET  /api/stats/:tableName
-    🔄 Receive Changes:   POST /api/sync/changes
-    💚 Health:            GET  /health
-    ════════════════════════════════════════════════════
+    ═══════════════════════════════════════════════════════
+    🌐 REMOTE PROXY SERVER (Receiver)
+    ═══════════════════════════════════════════════════════
+    📍 URL:              http://localhost:${PORT}
+    🔗 Public URL:       ${process.env.PUBLIC_URL || `http://localhost:${PORT}`}
+    
+    📡 Endpoints for Local Server:
+    └─ POST /realtimedata - Receive real-time data
+    
+    🏢 Endpoints for Branch Offices:
+    ├─ GET  /api/data/all     - Get all current data
+    ├─ GET  /api/data/page    - Get paginated data
+    ├─ POST /api/data/search  - Search/filter records
+    ├─ GET  /api/data/history - Get update history
+    ├─ GET  /api/data/summary - Get data summary
+    ├─ GET  /api/health       - Health check
+    └─ WS   /                 - WebSocket for real-time updates
+    
+    📊 Current Status:
+    ├─ Waiting for local server to send data...
+    └─ Ready to accept branch connections
+    ═══════════════════════════════════════════════════════
     `);
-}); 
-
-
+});
