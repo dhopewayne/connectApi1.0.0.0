@@ -73,7 +73,7 @@ app.get('/data/health', (req, res) => {
 });
 
 // ============= RECEIVE STREAM FROM LOCAL PC =============
-app.post('/realtimedata', async (req, res) => {
+app.post('/data/realtimedata', async (req, res) => {
     const { timestamp, records, count, source, table } = req.body;
     const sourceSecret = req.headers['x-source-secret'];
     const expectedSecret = process.env.REMOTE_SECRET;
