@@ -270,7 +270,7 @@ app.get('/data/find/:field/:value', async (req, res) => {
     }
     
     const matchedRecords = latestData.records.filter(record => 
-        String(record[field]).toLowerCase() === String(value).toLowerCase()
+        String(record[field]).toUpperCase() === String(value).toLowerCase()
     );
     
     console.log(`✅ Found ${matchedRecords.length} records`);
