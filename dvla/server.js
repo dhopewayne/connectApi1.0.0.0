@@ -73,7 +73,7 @@ app.get('/data/health', (req, res) => {
 });
 
 // ============= RECEIVE STREAM FROM LOCAL PC =============
-app.post('/data/realtimedata', async (req, res) => {
+app.post('/realtimedata', async (req, res) => {
     const { timestamp, records, count, source, table } = req.body;
     const sourceSecret = req.headers['x-source-secret'];
     const expectedSecret = process.env.REMOTE_SECRET;
@@ -146,7 +146,7 @@ app.post('/data/realtimedata', async (req, res) => {
     });
 });
 
-// ============= BRANCH OFFICE ENDPOINTS =============
+// ============= BRANCH OFFICE ENDPOINTS (UNCHANGED) =============
 
 // Get all current data
 app.get('/data/all', async (req, res) => {
@@ -270,7 +270,7 @@ app.get('/data/find/:field/:value', async (req, res) => {
     }
     
     const matchedRecords = latestData.records.filter(record => 
-        String(record[field]).toUpperCase() === String(value).toLowerCase()
+        String(record[field]).toUpperCase() === String(value).toUpperCase()
     );
     
     console.log(`✅ Found ${matchedRecords.length} records`);
@@ -455,15 +455,18 @@ server.listen(PORT, () => {
     └─ POST /realtimedata
     
     🏢 BRANCH OFFICE ENDPOINTS:
-    ├─ GET  /api/data/all       - Get all current data
-    ├─ GET  /api/data/page      - Get paginated data
-    ├─ POST /api/data/search    - Search/filter records
-    ├─ GET  /api/data/find/:field/:value - Find by field
-    ├─ GET  /api/data/stats     - Get statistics
-    ├─ GET  /api/data/history   - Get update history
-    ├─ GET  /api/data/export    - Export all data as JSON
-    ├─ GET  /api/health         - Health check
-    └─ WS   /                   - WebSocket for real-time updates
+    ├─ GET  /data/all       - Get all current data
+    ├─ GET  /data/page      - Get paginated data
+    ├─ POST /data/search    - Search/filter records
+    ├─ GET  /data/find/:field/:value - Find by field
+    ├─ GET  /data/stats     - Get statistics
+    ├─ GET  /data/history   - Get update history
+    ├─ GET  /data/export    - Export all data as JSON
+    ├─ GET  /health         - Health check
+    └─ WS   /               - WebSocket for real-time updates
+    
+    📡 REAL-TIME FEATURE:
+    └─ New data automatically pushed via WebSocket (no page refresh needed!)
     
     📊 Current Status:
     ├─ Data received: ${latestData.count} records
