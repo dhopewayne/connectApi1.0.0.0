@@ -147,13 +147,23 @@ app.post('/data/realtimedata', async (req, res) => {
 });
 
 // ============= BRANCH OFFICE ENDPOINTS (UNCHANGED) =============
+// Middleware to authenticate branch offices using a pc ip adresses and compare with the list of allowed ips in the .env file 
+const authenticateBranch = (req, res, next) => {
+    const branchIp = req.ip || req.connection.remoteAddress;
+    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? process.env.ALLOWED_BRANCH_IPS.split(',') : [];
+
+    if (!allowedIps.includes(branchIp)) {
+        console.log(`❌ Unauthorized branch access attempt from IP: ${branchIp}`);
+        return res.status(403).json({ error: 'Unauthorized branch access' });
+    }
+
+    console.log(`✅ Authorized branch access from IP: ${branchIp}`);
+    next();
+}
 
 // Get all current data
-app.get('/testResults', authenticateBranch, async (req, res) => {
-    console.log(`🏢 Branch requested all data`); 
-
-
-    
+app.get('/testResults', async (req, res) => {
+    console.log(`🏢 Branch requested all data`);     
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
             success: true, 
@@ -174,22 +184,6 @@ app.get('/testResults', authenticateBranch, async (req, res) => {
         table: latestData.table
     });
 }); 
-
-// Middleware to authenticate branch offices using a pc ip adresses and compare with the list of allowed ips in the .env file 
-const authenticateBranch = (req, res, next) => {
-    const branchIp = req.ip || req.connection.remoteAddress;
-    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? process.env.ALLOWED_BRANCH_IPS.split(',') : [];
-
-    if (!allowedIps.includes(branchIp)) {
-        console.log(`❌ Unauthorized branch access attempt from IP: ${branchIp}`);
-        return res.status(403).json({ error: 'Unauthorized branch access' });
-    }
-
-    console.log(`✅ Authorized branch access from IP: ${branchIp}`);
-    next();
-}
-
-
 
 
 
