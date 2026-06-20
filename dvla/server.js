@@ -149,27 +149,51 @@ app.post('/data/realtimedata', async (req, res) => {
 // ============= BRANCH OFFICE ENDPOINTS (UNCHANGED) =============
 
 // Get all current data
-app.get('/data/all', async (req, res) => {
-    console.log(`🏢 Branch requested all data`);
+app.get('/testResults', authenticateBranch, async (req, res) => {
+    console.log(`🏢 Branch requested all data`); 
+
+
     
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
-            success: true,
+            success: true, 
+            statusCode: 200,
+            statusMessage: 'successful',
             records: [],
-            count: 0,
             message: 'No data available yet. Waiting for local PC to send data.'
         });
     }
     
     res.json({
         success: true,
+        statusCode: 200,
+        statusMessage: 'OK',
         records: latestData.records,
-        count: latestData.count,
         lastUpdate: latestData.lastUpdate,
         source: latestData.source,
         table: latestData.table
     });
-});
+}); 
+
+// Middleware to authenticate branch offices using a pc ip adresses and compare with the list of allowed ips in the .env file 
+const authenticateBranch = (req, res, next) => {
+    const branchIp = req.ip || req.connection.remoteAddress;
+    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? process.env.ALLOWED_BRANCH_IPS.split(',') : [];
+
+    if (!allowedIps.includes(branchIp)) {
+        console.log(`❌ Unauthorized branch access attempt from IP: ${branchIp}`);
+        return res.status(403).json({ error: 'Unauthorized branch access' });
+    }
+
+    console.log(`✅ Authorized branch access from IP: ${branchIp}`);
+    next();
+}
+
+
+
+
+
+
 
 // Get paginated data
 app.get('/data/page', async (req, res) => {
@@ -181,7 +205,9 @@ app.get('/data/page', async (req, res) => {
     
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
-            success: true,
+            success: true, 
+            statusCode: 200,
+            statusMessage: 'OK',
             records: [],
             total: 0,
             page: page,
@@ -195,6 +221,8 @@ app.get('/data/page', async (req, res) => {
     
     res.json({
         success: true,
+        statusCode: 200,
+        statusMessage: 'OK',
         records: paginatedRecords,
         total: latestData.count,
         page: page,
