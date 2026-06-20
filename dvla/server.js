@@ -162,11 +162,10 @@ const authenticateBranch = (req, res, next) => {
 }
 
 // Get all current data
-app.get('/testResults', async (req, res) => {
+app.get('/testresults', async (req, res) => {
     console.log(`🏢 Branch requested all data`);     
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
-            success: true, 
             statusCode: 200,
             statusMessage: 'successful',
             records: [],
