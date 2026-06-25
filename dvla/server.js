@@ -1,7 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
-const socketIo = require('socket.io');
+const socketIo = require('socket.io'); 
+const requestIp = require('request-ip');
 require('dotenv').config();
 
 const app = express();
@@ -115,7 +116,21 @@ app.get('/my-mac', (req, res) => {
     res.json({
         mac: clientMac || 'Not available'
     });
+});  
+
+app.get('/my-ip', (req, res) => {
+    const clientIP = requestIp.getClientIp(req);
+    
+    console.log(`\n🌐 IP REQUEST: ${clientIP || 'Not provided'}`);
+    
+    res.json({ 
+        ip: clientIP || 'Not available' 
+    });
 });
+
+
+
+
 
 // ============= ROOT ENDPOINT =============
 app.get('/', (req, res) => {
