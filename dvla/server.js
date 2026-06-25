@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
-const os = require('os');
 require('dotenv').config();
 
 const app = express();
@@ -79,112 +78,42 @@ const authenticateBranch = (req, res, next) => {
     console.log(`\n🔐 AUTHENTICATION CHECK:`);
     console.log(`   🖥️  Client MAC: ${clientMac || 'Not provided'}`);
     console.log(`   📍 Client IP: ${clientIp}`);
-    console.log(`   📋 Allowed MACs: ${allowedMacs.length > 0 ? allowedMacs.join(', ') : 'None configured'}`);
 
-    // Check if MAC is provided
     if (!clientMac) {
         console.log(`   ❌ No MAC address provided`);
         return res.status(401).json({
             success: false,
             error: 'MAC address required',
-            message: 'Send x-mac-address header with your device MAC address',
-            how_to_get_mac: 'Visit GET /my-mac to see your MAC address'
+            message: 'Send x-mac-address header'
         });
     }
 
-    // Check if MAC is allowed
     const isAllowed = allowedMacs.length === 0 || allowedMacs.includes(clientMac.toUpperCase());
     
     if (isAllowed) {
-        console.log(`   ✅ ACCESS GRANTED - MAC ${clientMac} is authorized`);
+        console.log(`   ✅ ACCESS GRANTED`);
         next();
     } else {
-        console.log(`   ❌ ACCESS DENIED - MAC ${clientMac} not in allowed list`);
+        console.log(`   ❌ ACCESS DENIED`);
         return res.status(403).json({
             success: false,
-            error: 'Device not authorized',
-            your_mac: clientMac,
-            message: 'This MAC address is not registered. Contact administrator.',
-            how_to_get_mac: 'Visit GET /my-mac to see your MAC address'
+            error: 'Device not authorized'
         });
     }
 };
 
-// Apply authentication to branch endpoints
+// Apply authentication
 app.use('/testresults', authenticateBranch);
 app.use('/data', authenticateBranch);
 
-// ============= ENDPOINT: Get Your MAC Address =============
+// ============= ENDPOINT: Get MAC Address =============
 app.get('/my-mac', (req, res) => {
-    // Get MAC from request header (client sends it)
     const clientMac = req.headers['x-mac-address'];
-    const clientIp = getClientIp(req);
     
-    console.log(`\n📱 MAC ADDRESS REQUEST:`);
-    console.log(`   📍 Client IP: ${clientIp}`);
-    console.log(`   🖥️  MAC from header: ${clientMac || 'Not provided'}`);
+    console.log(`\n📱 MAC REQUEST: ${clientMac || 'Not provided'}`);
     
-    // Get all network interfaces MAC addresses (server side)
-    const networkInterfaces = os.networkInterfaces();
-    const macAddresses = [];
-    
-    for (const [name, interfaces] of Object.entries(networkInterfaces)) {
-        for (const iface of interfaces) {
-            // Skip internal/localhost and non-IPv4
-            if (!iface.internal && iface.family === 'IPv4' && iface.mac !== '00:00:00:00:00:00') {
-                macAddresses.push({
-                    interface: name,
-                    mac: iface.mac,
-                    address: iface.address,
-                    family: iface.family
-                });
-            }
-        }
-    }
-
-    // Instructions for client to get their MAC address
-    const instructions = {
-        windows: 'Open Command Prompt and run: ipconfig /all | findstr "Physical Address"',
-        mac_linux: 'Open Terminal and run: ifconfig | grep ether  OR  ip link show | grep ether',
-        format: 'Use format like: E8:FB:1C:0B:61:DB (with colons)'
-    };
-
-    // If client provided MAC in header, show it
-    if (clientMac) {
-        const isAllowed = process.env.ALLOWED_MACS ? 
-            process.env.ALLOWED_MACS.split(',').map(mac => mac.trim().toUpperCase()).includes(clientMac.toUpperCase()) : 
-            false;
-        
-        return res.json({
-            success: true,
-            timestamp: new Date().toISOString(),
-            your_ip: clientIp,
-            your_mac: clientMac,
-            mac_status: isAllowed ? '✅ This MAC is authorized' : '❌ This MAC is NOT authorized',
-            allowed_macs: process.env.ALLOWED_MACS ? process.env.ALLOWED_MACS.split(',').map(m => m.trim()) : [],
-            server_macs: macAddresses,
-            instructions: instructions,
-            how_to_use: {
-                header: 'x-mac-address',
-                example: `curl -H "x-mac-address: ${clientMac}" https://your-server.com/testresults`
-            }
-        });
-    }
-
-    // If no MAC provided, show instructions
     res.json({
-        success: true,
-        timestamp: new Date().toISOString(),
-        your_ip: clientIp,
-        mac_not_provided: true,
-        message: 'You didn\'t send a MAC address in the request header',
-        instructions: instructions,
-        how_to_send: {
-            header: 'x-mac-address',
-            example: 'curl -H "x-mac-address: E8:FB:1C:0B:61:DB" https://your-server.com/my-mac'
-        },
-        server_macs: macAddresses,
-        note: 'The server MAC addresses shown are for reference only. Your client MAC is what you need to send.'
+        mac: clientMac || 'Not available'
     });
 });
 
@@ -194,29 +123,23 @@ app.get('/', (req, res) => {
         name: 'Remote Data Relay Server',
         status: 'online',
         version: '1.0.0',
-        description: 'Receives data from local PC and relays to branch offices',
-        authentication: {
-            type: 'MAC Address based',
-            how_to_authenticate: 'Send x-mac-address header with your device MAC',
-            get_your_mac: 'GET /my-mac'
-        },
         endpoints: {
-            receive_stream: 'POST /data/realtimedata (for local PC)',
-            get_all_data: 'GET /testresults (requires MAC auth)',
-            get_paginated: 'GET /data/page?page=1&pageSize=100 (requires MAC auth)',
-            search: 'POST /data/search (requires MAC auth)',
-            find_by_field: 'GET /data/find/:field/:value (requires MAC auth)',
-            stats: 'GET /data/stats (requires MAC auth)',
-            history: 'GET /data/history (requires MAC auth)',
-            health: 'GET /data/health (public)',
-            my_mac: 'GET /my-mac (public - shows your MAC)'
+            receive_stream: 'POST /data/realtimedata',
+            get_all_data: 'GET /testresults',
+            get_paginated: 'GET /data/page?page=1&pageSize=100',
+            search: 'POST /data/search',
+            find_by_field: 'GET /data/find/:field/:value',
+            stats: 'GET /data/stats',
+            history: 'GET /data/history',
+            health: 'GET /data/health',
+            my_mac: 'GET /my-mac'
         },
         websocket: 'wss://' + req.get('host'),
         timestamp: new Date().toISOString()
     });
 });
 
-// ============= HEALTH CHECK (Public) =============
+// ============= HEALTH CHECK =============
 app.get('/data/health', (req, res) => {
     res.json({
         status: 'online',
@@ -297,7 +220,7 @@ app.post('/data/realtimedata', async (req, res) => {
     });
 });
 
-// ============= PROTECTED BRANCH OFFICE ENDPOINTS =============
+// ============= BRANCH OFFICE ENDPOINTS =============
 app.get('/testresults', async (req, res) => {
     console.log(`🏢 Branch requested all data`);     
     if (!latestData.records || latestData.records.length === 0) {
@@ -592,35 +515,10 @@ io.on('connection', (socket) => {
 server.listen(PORT, () => {
     console.log(`
     ═══════════════════════════════════════════════════════
-    🌐 REMOTE RELAY SERVER - MAC ADDRESS AUTHENTICATION
+    🌐 REMOTE RELAY SERVER
     ═══════════════════════════════════════════════════════
     📍 Server URL:       ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
-    
-    🔐 AUTHENTICATION:
-    ├─ Type: MAC Address (Hardware-based - Never changes!)
-    ├─ How to get MAC: GET /my-mac
-    └─ How to use: Send header "x-mac-address: YOUR_MAC"
-    
-    📡 ENDPOINTS:
-    ├─ PUBLIC:   GET  /my-mac           - Get your MAC address
-    ├─ PUBLIC:   GET  /data/health      - Health check
-    ├─ PROTECTED: GET  /testresults     - Get all data
-    ├─ PROTECTED: GET  /data/page       - Get paginated data
-    ├─ PROTECTED: POST /data/search     - Search/filter records
-    ├─ PROTECTED: GET  /data/find/:field/:value - Find by field
-    ├─ PROTECTED: GET  /data/stats      - Get statistics
-    ├─ PROTECTED: GET  /data/history    - Get update history
-    ├─ PROTECTED: GET  /data/export     - Export all data
-    └─ PROTECTED: WS   /                - WebSocket for real-time updates
-    
-    📝 SETUP INSTRUCTIONS:
-    1. Client visits GET /my-mac to see their MAC
-    2. Copy the MAC address
-    3. Add to .env: ALLOWED_MACS=E8:FB:1C:0B:61:DB,AA:BB:CC:DD:EE:FF
-    4. Restart server
-    5. Client sends header: x-mac-address: E8:FB:1C:0B:61:DB
-    
-    💡 MAC ADDRESS NEVER CHANGES (unlike IP addresses!)
+    📡 Endpoint:         GET /my-mac
     ═══════════════════════════════════════════════════════
     `);
 });
