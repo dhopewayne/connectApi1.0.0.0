@@ -39,33 +39,33 @@ app.use((req, res, next) => {
 });
 
 // ============= HELPER: Get Client IP =============
-function getClientIp(req) {
-    const forwarded = req.headers['x-forwarded-for'];
-    if (forwarded) {
-        const ips = forwarded.split(',');
-        return ips[0].trim();
-    }
+// function getClientIp(req) {
+//     const forwarded = req.headers['x-forwarded-for'];
+//     if (forwarded) {
+//         const ips = forwarded.split(',');
+//         return ips[0].trim();
+//     }
     
-    const ip = req.headers['x-real-ip'] || 
-               req.headers['true-client-ip'] ||
-               req.headers['cf-connecting-ip'] ||
-               req.ip ||
-               req.connection.remoteAddress ||
-               req.socket.remoteAddress;
+//     const ip = req.headers['x-real-ip'] || 
+//                req.headers['true-client-ip'] ||
+//                req.headers['cf-connecting-ip'] ||
+//                req.ip ||
+//                req.connection.remoteAddress ||
+//                req.socket.remoteAddress;
     
-    if (ip === '::1' || ip === '::ffff:127.0.0.1') {
-        return '127.0.0.1';
-    }
+//     if (ip === '::1' || ip === '::ffff:127.0.0.1') {
+//         return '127.0.0.1';
+//     }
     
-    if (ip && ip.includes(':')) {
-        const parts = ip.split(':');
-        if (parts.length === 2 && !isNaN(parts[1])) {
-            return parts[0];
-        }
-    }
+//     if (ip && ip.includes(':')) {
+//         const parts = ip.split(':');
+//         if (parts.length === 2 && !isNaN(parts[1])) {
+//             return parts[0];
+//         }
+//     }
     
-    return ip || 'Unknown IP';
-}
+//     return ip || 'Unknown IP';
+// }
 
 // ============= AUTHENTICATION =============
 const authenticateBranch = (req, res, next) => {
