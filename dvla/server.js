@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
+const os = require('os');
 require('dotenv').config();
 
 const app = express();
@@ -18,7 +19,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(cors());
 
-// ============= STORAGE (in-memory, no database) =============
+// ============= STORAGE =============
 let latestData = {
     records: [],
     lastUpdate: null,
@@ -39,29 +40,23 @@ app.use((req, res, next) => {
 
 // ============= HELPER: Get Client IP =============
 function getClientIp(req) {
-    // Check for forwarded IPs (when behind proxy/load balancer)
     const forwarded = req.headers['x-forwarded-for'];
     if (forwarded) {
-        // Get the first IP in the chain (client's real IP)
         const ips = forwarded.split(',');
         return ips[0].trim();
     }
     
-    // Check other common headers
     const ip = req.headers['x-real-ip'] || 
                req.headers['true-client-ip'] ||
-               req.headers['cf-connecting-ip'] || // Cloudflare
-               req.headers['x-cluster-client-ip'] ||
+               req.headers['cf-connecting-ip'] ||
                req.ip ||
                req.connection.remoteAddress ||
                req.socket.remoteAddress;
     
-    // Clean up IPv6 localhost format
     if (ip === '::1' || ip === '::ffff:127.0.0.1') {
         return '127.0.0.1';
     }
     
-    // Remove port if present
     if (ip && ip.includes(':')) {
         const parts = ip.split(':');
         if (parts.length === 2 && !isNaN(parts[1])) {
@@ -72,40 +67,126 @@ function getClientIp(req) {
     return ip || 'Unknown IP';
 }
 
-// ============= AUTHENTICATION MIDDLEWARE =============
+// ============= AUTHENTICATION =============
 const authenticateBranch = (req, res, next) => {
-    // Get the client's IP (this is the public IP when accessed from internet)
     const clientIp = getClientIp(req);
+    const clientMac = req.headers['x-mac-address'];
     
-    // Get allowed IPs from environment variable
-    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? 
-        process.env.ALLOWED_BRANCH_IPS.split(',').map(ip => ip.trim()) : 
+    const allowedMacs = process.env.ALLOWED_MACS ? 
+        process.env.ALLOWED_MACS.split(',').map(mac => mac.trim().toUpperCase()) : 
         [];
-    
+
     console.log(`\n🔐 AUTHENTICATION CHECK:`);
+    console.log(`   🖥️  Client MAC: ${clientMac || 'Not provided'}`);
     console.log(`   📍 Client IP: ${clientIp}`);
-    console.log(`   📋 Allowed IPs: ${allowedIps.length > 0 ? allowedIps.join(', ') : 'None configured'}`);
-    
-    // Check if IP is allowed
-    const isAllowed = allowedIps.length === 0 || allowedIps.includes(clientIp);
+    console.log(`   📋 Allowed MACs: ${allowedMacs.length > 0 ? allowedMacs.join(', ') : 'None configured'}`);
+
+    // Check if MAC is provided
+    if (!clientMac) {
+        console.log(`   ❌ No MAC address provided`);
+        return res.status(401).json({
+            success: false,
+            error: 'MAC address required',
+            message: 'Send x-mac-address header with your device MAC address',
+            how_to_get_mac: 'Visit GET /my-mac to see your MAC address'
+        });
+    }
+
+    // Check if MAC is allowed
+    const isAllowed = allowedMacs.length === 0 || allowedMacs.includes(clientMac.toUpperCase());
     
     if (isAllowed) {
-        console.log(`   ✅ ACCESS GRANTED - IP is allowed`);
+        console.log(`   ✅ ACCESS GRANTED - MAC ${clientMac} is authorized`);
         next();
     } else {
-        console.log(`   ❌ ACCESS DENIED - IP not in allowed list`);
+        console.log(`   ❌ ACCESS DENIED - MAC ${clientMac} not in allowed list`);
         return res.status(403).json({
             success: false,
-            error: 'Access denied. Your IP is not authorized.',
-            your_ip: clientIp,
-            timestamp: new Date().toISOString()
+            error: 'Device not authorized',
+            your_mac: clientMac,
+            message: 'This MAC address is not registered. Contact administrator.',
+            how_to_get_mac: 'Visit GET /my-mac to see your MAC address'
         });
     }
 };
 
-// ============= Apply Authentication to All Branch Endpoints =============
+// Apply authentication to branch endpoints
 app.use('/testresults', authenticateBranch);
 app.use('/data', authenticateBranch);
+
+// ============= ENDPOINT: Get Your MAC Address =============
+app.get('/my-mac', (req, res) => {
+    // Get MAC from request header (client sends it)
+    const clientMac = req.headers['x-mac-address'];
+    const clientIp = getClientIp(req);
+    
+    console.log(`\n📱 MAC ADDRESS REQUEST:`);
+    console.log(`   📍 Client IP: ${clientIp}`);
+    console.log(`   🖥️  MAC from header: ${clientMac || 'Not provided'}`);
+    
+    // Get all network interfaces MAC addresses (server side)
+    const networkInterfaces = os.networkInterfaces();
+    const macAddresses = [];
+    
+    for (const [name, interfaces] of Object.entries(networkInterfaces)) {
+        for (const iface of interfaces) {
+            // Skip internal/localhost and non-IPv4
+            if (!iface.internal && iface.family === 'IPv4' && iface.mac !== '00:00:00:00:00:00') {
+                macAddresses.push({
+                    interface: name,
+                    mac: iface.mac,
+                    address: iface.address,
+                    family: iface.family
+                });
+            }
+        }
+    }
+
+    // Instructions for client to get their MAC address
+    const instructions = {
+        windows: 'Open Command Prompt and run: ipconfig /all | findstr "Physical Address"',
+        mac_linux: 'Open Terminal and run: ifconfig | grep ether  OR  ip link show | grep ether',
+        format: 'Use format like: E8:FB:1C:0B:61:DB (with colons)'
+    };
+
+    // If client provided MAC in header, show it
+    if (clientMac) {
+        const isAllowed = process.env.ALLOWED_MACS ? 
+            process.env.ALLOWED_MACS.split(',').map(mac => mac.trim().toUpperCase()).includes(clientMac.toUpperCase()) : 
+            false;
+        
+        return res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            your_ip: clientIp,
+            your_mac: clientMac,
+            mac_status: isAllowed ? '✅ This MAC is authorized' : '❌ This MAC is NOT authorized',
+            allowed_macs: process.env.ALLOWED_MACS ? process.env.ALLOWED_MACS.split(',').map(m => m.trim()) : [],
+            server_macs: macAddresses,
+            instructions: instructions,
+            how_to_use: {
+                header: 'x-mac-address',
+                example: `curl -H "x-mac-address: ${clientMac}" https://your-server.com/testresults`
+            }
+        });
+    }
+
+    // If no MAC provided, show instructions
+    res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        your_ip: clientIp,
+        mac_not_provided: true,
+        message: 'You didn\'t send a MAC address in the request header',
+        instructions: instructions,
+        how_to_send: {
+            header: 'x-mac-address',
+            example: 'curl -H "x-mac-address: E8:FB:1C:0B:61:DB" https://your-server.com/my-mac'
+        },
+        server_macs: macAddresses,
+        note: 'The server MAC addresses shown are for reference only. Your client MAC is what you need to send.'
+    });
+});
 
 // ============= ROOT ENDPOINT =============
 app.get('/', (req, res) => {
@@ -115,55 +196,23 @@ app.get('/', (req, res) => {
         version: '1.0.0',
         description: 'Receives data from local PC and relays to branch offices',
         authentication: {
-            type: 'IP-based',
-            how_it_works: 'Your public IP must be in the ALLOWED_BRANCH_IPS list',
-            check_your_ip: 'GET /myip'
+            type: 'MAC Address based',
+            how_to_authenticate: 'Send x-mac-address header with your device MAC',
+            get_your_mac: 'GET /my-mac'
         },
         endpoints: {
             receive_stream: 'POST /data/realtimedata (for local PC)',
-            get_all_data: 'GET /testresults (requires authentication)',
-            get_paginated: 'GET /data/page?page=1&pageSize=100 (requires authentication)',
-            search: 'POST /data/search (requires authentication)',
-            find_by_field: 'GET /data/find/:field/:value (requires authentication)',
-            stats: 'GET /data/stats (requires authentication)',
-            history: 'GET /data/history (requires authentication)',
+            get_all_data: 'GET /testresults (requires MAC auth)',
+            get_paginated: 'GET /data/page?page=1&pageSize=100 (requires MAC auth)',
+            search: 'POST /data/search (requires MAC auth)',
+            find_by_field: 'GET /data/find/:field/:value (requires MAC auth)',
+            stats: 'GET /data/stats (requires MAC auth)',
+            history: 'GET /data/history (requires MAC auth)',
             health: 'GET /data/health (public)',
-            check_my_ip: 'GET /myip (public)'
+            my_mac: 'GET /my-mac (public - shows your MAC)'
         },
         websocket: 'wss://' + req.get('host'),
         timestamp: new Date().toISOString()
-    });
-});
-
-// ============= PUBLIC ENDPOINT: Check Your IP =============
-app.get('/myip', (req, res) => {
-    const clientIp = getClientIp(req);
-    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? 
-        process.env.ALLOWED_BRANCH_IPS.split(',').map(ip => ip.trim()) : 
-        [];
-    
-    const isAllowed = allowedIps.length === 0 || allowedIps.includes(clientIp);
-    
-    console.log(`\n📱 IP CHECK REQUEST:`);
-    console.log(`   Client IP: ${clientIp}`);
-    console.log(`   Is Allowed: ${isAllowed}`);
-    
-    res.json({
-        success: true,
-        timestamp: new Date().toISOString(),
-        your_public_ip: clientIp,
-        is_authorized: isAllowed,
-        allowed_ips: allowedIps,
-        message: isAllowed ? 
-            '✅ Your IP is authorized to access the endpoints' : 
-            '❌ Your IP is NOT authorized. Add it to ALLOWED_BRANCH_IPS in .env file',
-        how_to_allow: {
-            step1: 'Find your IP above (this is what the server sees)',
-            step2: 'Add it to ALLOWED_BRANCH_IPS in your .env file',
-            step3: 'Restart the server',
-            example: 'ALLOWED_BRANCH_IPS=154.161.48.219,203.45.67.89,192.168.1.100'
-        },
-        note: 'This is your PUBLIC IP address (what the internet sees). Use this IP for authentication.'
     });
 });
 
@@ -191,7 +240,6 @@ app.post('/data/realtimedata', async (req, res) => {
     console.log(`   Source: ${source || 'local_pc'}`);
     console.log(`   Table: ${table || 'unknown'}`);
     
-    // Verify secret if configured
     if (expectedSecret && sourceSecret !== expectedSecret) {
         console.log(`❌ Invalid secret - rejecting data`);
         return res.status(401).json({ error: 'Invalid secret' });
@@ -202,7 +250,6 @@ app.post('/data/realtimedata', async (req, res) => {
         return res.json({ success: true, message: 'No data to process' });
     }
     
-    // Store latest data
     latestData = {
         records: records,
         lastUpdate: new Date().toISOString(),
@@ -212,22 +259,18 @@ app.post('/data/realtimedata', async (req, res) => {
         receivedAt: timestamp
     };
     
-    // Add to history
     dataHistory.unshift({
         timestamp: new Date().toISOString(),
         recordCount: records.length,
         source: source || 'local_pc'
     });
     
-    // Keep only last 50 updates
-    if (dataHistory.length > 50) {
+    if (dataHistory.length > MAX_HISTORY) {
         dataHistory.pop();
     }
     
     console.log(`✅ Data stored: ${records.length} records`);
-    console.log(`   History size: ${dataHistory.length}`);
     
-    // Broadcast to all connected branch offices via WebSocket
     const broadcastPayload = {
         type: 'live_update',
         timestamp: new Date().toISOString(),
@@ -255,7 +298,6 @@ app.post('/data/realtimedata', async (req, res) => {
 });
 
 // ============= PROTECTED BRANCH OFFICE ENDPOINTS =============
-// Get all current data
 app.get('/testresults', async (req, res) => {
     console.log(`🏢 Branch requested all data`);     
     if (!latestData.records || latestData.records.length === 0) {
@@ -278,7 +320,6 @@ app.get('/testresults', async (req, res) => {
     });
 }); 
 
-// Get paginated data
 app.get('/data/page', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const pageSize = Math.min(parseInt(req.query.pageSize) || 100, 1000);
@@ -315,7 +356,6 @@ app.get('/data/page', async (req, res) => {
     });
 });
 
-// Search/filter records
 app.post('/data/search', async (req, res) => {
     const { filters = {}, searchTerm = null } = req.body;
     
@@ -334,7 +374,6 @@ app.post('/data/search', async (req, res) => {
     
     let filteredRecords = [...latestData.records];
     
-    // Global search across all fields
     if (searchTerm) {
         const term = searchTerm.toLowerCase();
         filteredRecords = filteredRecords.filter(record => {
@@ -344,7 +383,6 @@ app.post('/data/search', async (req, res) => {
         });
     }
     
-    // Field-specific exact match filters
     if (filters && Object.keys(filters).length > 0) {
         filteredRecords = filteredRecords.filter(record => {
             return Object.entries(filters).every(([key, value]) => {
@@ -365,7 +403,6 @@ app.post('/data/search', async (req, res) => {
     });
 });
 
-// Find by specific field/value
 app.get('/data/find/:field/:value', async (req, res) => {
     const { field, value } = req.params;
     
@@ -395,7 +432,6 @@ app.get('/data/find/:field/:value', async (req, res) => {
     });
 });
 
-// Get data statistics
 app.get('/data/stats', async (req, res) => {
     console.log(`🏢 Branch requested stats`);
     
@@ -425,7 +461,6 @@ app.get('/data/stats', async (req, res) => {
     });
 });
 
-// Get update history
 app.get('/data/history', async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 20, 100);
     
@@ -442,7 +477,6 @@ app.get('/data/history', async (req, res) => {
     });
 });
 
-// Export all data as JSON
 app.get('/data/export', async (req, res) => {
     console.log(`🏢 Branch requested data export`);
     
@@ -463,18 +497,19 @@ app.get('/data/export', async (req, res) => {
     });
 });
 
-// ============= WEBSOCKET FOR BRANCH OFFICES =============
+// ============= WEBSOCKET =============
 io.on('connection', (socket) => {
     const branchId = socket.id;
     const clientIp = socket.handshake.address || socket.handshake.headers['x-forwarded-for'];
+    const clientMac = socket.handshake.headers['x-mac-address'] || 'Not provided';
     
     console.log(`\n🔐 WEBSOCKET CONNECTION:`);
     console.log(`   📍 Client IP: ${clientIp}`);
+    console.log(`   🖥️  MAC: ${clientMac}`);
     console.log(`   🆔 Socket ID: ${branchId}`);
     
     connectedBranches.set(branchId, socket);
     
-    // Send current status and data immediately
     if (latestData.records && latestData.records.length > 0) {
         socket.emit('connected', {
             status: 'connected',
@@ -501,7 +536,6 @@ io.on('connection', (socket) => {
         });
     }
     
-    // Handle filter requests
     socket.on('filter_request', (filters) => {
         console.log(`🔍 Branch ${branchId} requested filter:`, filters);
         
@@ -530,7 +564,6 @@ io.on('connection', (socket) => {
         console.log(`📤 Sent ${filtered.length} filtered records to branch ${branchId}`);
     });
     
-    // Handle refresh requests
     socket.on('refresh_request', () => {
         console.log(`🔄 Branch ${branchId} requested refresh`);
         
@@ -545,7 +578,6 @@ io.on('connection', (socket) => {
         }
     });
     
-    // Handle ping for connection health
     socket.on('ping', () => {
         socket.emit('pong', { timestamp: new Date().toISOString() });
     });
@@ -560,33 +592,35 @@ io.on('connection', (socket) => {
 server.listen(PORT, () => {
     console.log(`
     ═══════════════════════════════════════════════════════
-    🌐 REMOTE RELAY SERVER WITH IP AUTHENTICATION
+    🌐 REMOTE RELAY SERVER - MAC ADDRESS AUTHENTICATION
     ═══════════════════════════════════════════════════════
     📍 Server URL:       ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
     
     🔐 AUTHENTICATION:
-    ├─ Type: IP-based authentication
-    ├─ Allowed IPs: ${process.env.ALLOWED_BRANCH_IPS || 'Not configured yet!'}
-    └─ Check your IP: GET /myip
+    ├─ Type: MAC Address (Hardware-based - Never changes!)
+    ├─ How to get MAC: GET /my-mac
+    └─ How to use: Send header "x-mac-address: YOUR_MAC"
     
     📡 ENDPOINTS:
-    ├─ PUBLIC:   GET  /myip          - Check your IP and authorization status
-    ├─ PUBLIC:   GET  /data/health   - Health check
-    ├─ PROTECTED: GET  /testresults  - Get all data
-    ├─ PROTECTED: GET  /data/page    - Get paginated data
-    ├─ PROTECTED: POST /data/search  - Search/filter records
+    ├─ PUBLIC:   GET  /my-mac           - Get your MAC address
+    ├─ PUBLIC:   GET  /data/health      - Health check
+    ├─ PROTECTED: GET  /testresults     - Get all data
+    ├─ PROTECTED: GET  /data/page       - Get paginated data
+    ├─ PROTECTED: POST /data/search     - Search/filter records
     ├─ PROTECTED: GET  /data/find/:field/:value - Find by field
-    ├─ PROTECTED: GET  /data/stats   - Get statistics
-    ├─ PROTECTED: GET  /data/history - Get update history
-    ├─ PROTECTED: GET  /data/export  - Export all data
-    └─ PROTECTED: WS   /             - WebSocket for real-time updates
+    ├─ PROTECTED: GET  /data/stats      - Get statistics
+    ├─ PROTECTED: GET  /data/history    - Get update history
+    ├─ PROTECTED: GET  /data/export     - Export all data
+    └─ PROTECTED: WS   /                - WebSocket for real-time updates
     
-    📝 INSTRUCTIONS:
-    1. Visit GET /myip to see your public IP
-    2. Copy the IP shown
-    3. Add it to ALLOWED_BRANCH_IPS in .env file
-    4. Restart the server
-    5. Your IP is now authorized!
+    📝 SETUP INSTRUCTIONS:
+    1. Client visits GET /my-mac to see their MAC
+    2. Copy the MAC address
+    3. Add to .env: ALLOWED_MACS=E8:FB:1C:0B:61:DB,AA:BB:CC:DD:EE:FF
+    4. Restart server
+    5. Client sends header: x-mac-address: E8:FB:1C:0B:61:DB
+    
+    💡 MAC ADDRESS NEVER CHANGES (unlike IP addresses!)
     ═══════════════════════════════════════════════════════
     `);
 });
