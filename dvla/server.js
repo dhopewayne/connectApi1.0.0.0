@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
-const os = require('os'); // Add this for network interfaces
 require('dotenv').config();
 
 const app = express();
@@ -40,17 +39,18 @@ app.use((req, res, next) => {
 
 // ============= TEST AUTH MIDDLEWARE (LOGS IP ONLY) =============
 const authenticateBranch = (req, res, next) => {
-    const branchIp = req.ip || req.connection.remoteAddress || req.headers['x-forwarded-for'];
+    // Get client IP from various sources (handles proxies)
+    const clientIp = getClientIp(req);
     const allowedIps = process.env.ALLOWED_BRANCH_IPS ? process.env.ALLOWED_BRANCH_IPS.split(',') : [];
 
     console.log(`\n🔐 BRANCH AUTH CHECK:`);
-    console.log(`   📍 Client IP: ${branchIp}`);
+    console.log(`   📍 Client IP: ${clientIp}`);
     console.log(`   📋 Allowed IPs: ${allowedIps.length > 0 ? allowedIps.join(', ') : 'No IPs configured'}`);
-    console.log(`   ✅ Auth Status: ${allowedIps.includes(branchIp) ? 'GRANTED ✅' : 'DENIED ❌'}`);
+    console.log(`   ✅ Auth Status: ${allowedIps.includes(clientIp) ? 'GRANTED ✅' : 'DENIED ❌'}`);
     
     // FOR TESTING: Always allow access but log everything
-    if (!allowedIps.includes(branchIp)) {
-        console.log(`   ⚠️  WARNING: IP ${branchIp} is NOT in the allowed list!`);
+    if (!allowedIps.includes(clientIp)) {
+        console.log(`   ⚠️  WARNING: IP ${clientIp} is NOT in the allowed list!`);
         // Uncomment below to actually block access
         // return res.status(403).json({ error: 'Unauthorized branch access' });
     }
@@ -58,24 +58,52 @@ const authenticateBranch = (req, res, next) => {
     next();
 };
 
+// Helper function to get client IP from various sources
+function getClientIp(req) {
+    // Check for forwarded IPs (when behind proxy/load balancer)
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        // Get the first IP in the chain (client's real IP)
+        const ips = forwarded.split(',');
+        return ips[0].trim();
+    }
+    
+    // Check other common headers
+    const ip = req.headers['x-real-ip'] || 
+               req.headers['true-client-ip'] ||
+               req.headers['cf-connecting-ip'] || // Cloudflare
+               req.headers['x-cluster-client-ip'] ||
+               req.ip ||
+               req.connection.remoteAddress ||
+               req.socket.remoteAddress;
+    
+    // Clean up IPv6 localhost format
+    if (ip === '::1' || ip === '::ffff:127.0.0.1') {
+        return '127.0.0.1';
+    }
+    
+    // Remove port if present
+    if (ip && ip.includes(':')) {
+        const parts = ip.split(':');
+        if (parts.length === 2 && !isNaN(parts[1])) {
+            return parts[0];
+        }
+    }
+    
+    return ip || 'Unknown IP';
+}
+
 // Apply authentication middleware to all branch endpoints
 app.use('/testresults', authenticateBranch);
 app.use('/data', authenticateBranch);
 
 // ============= ROOT ENDPOINT =============
 app.get('/', (req, res) => {
-    // Get server's network IPs
-    const networkIps = getNetworkIPs();
-    
     res.json({
         name: 'Remote Data Relay Server',
         status: 'online',
         version: '1.0.0',
         description: 'Receives data from local PC and relays to branch offices',
-        server_addresses: {
-            localhost: `http://localhost:${PORT}`,
-            network: networkIps.map(ip => `http://${ip}:${PORT}`)
-        },
         endpoints: {
             receive_stream: 'POST /data/realtimedata (for local PC)',
             get_all_data: 'GET /testresults',
@@ -87,101 +115,93 @@ app.get('/', (req, res) => {
             health: 'GET /data/health',
             show_ip: 'GET /ipshow'
         },
-        websocket: `ws://${networkIps[0] || 'localhost'}:${PORT}`,
+        websocket: 'wss://' + req.get('host'),
         timestamp: new Date().toISOString()
     });
 });
 
-// Helper function to get network IPs
-function getNetworkIPs() {
-    const interfaces = os.networkInterfaces();
-    const ips = [];
-    
-    for (const name of Object.keys(interfaces)) {
-        for (const iface of interfaces[name]) {
-            // Skip internal (localhost) and non-IPv4
-            if (iface.internal || iface.family !== 'IPv4') continue;
-            ips.push(iface.address);
-        }
-    }
-    return ips;
-}
-
 // ============= IP SHOW ENDPOINT =============
 app.get('/ipshow', (req, res) => {
-    // Get IP from various sources (handles proxies too)
-    const clientIp = req.ip || 
-                    req.connection.remoteAddress || 
-                    req.socket.remoteAddress || 
-                    req.headers['x-forwarded-for'] || 
-                    'Unknown IP';
+    // Get client IP using the helper function
+    const clientIp = getClientIp(req);
     
     // Get all possible IP sources for debugging
     const ipSources = {
+        'x-forwarded-for': req.headers['x-forwarded-for'] || 'Not available',
+        'x-real-ip': req.headers['x-real-ip'] || 'Not available',
+        'true-client-ip': req.headers['true-client-ip'] || 'Not available',
+        'cf-connecting-ip': req.headers['cf-connecting-ip'] || 'Not available',
+        'x-cluster-client-ip': req.headers['x-cluster-client-ip'] || 'Not available',
         'req.ip': req.ip || 'Not available',
         'req.connection.remoteAddress': req.connection.remoteAddress || 'Not available',
-        'req.socket.remoteAddress': req.socket.remoteAddress || 'Not available',
-        'req.headers.x-forwarded-for': req.headers['x-forwarded-for'] || 'Not available',
-        'req.headers.true-client-ip': req.headers['true-client-ip'] || 'Not available',
-        'req.headers.x-real-ip': req.headers['x-real-ip'] || 'Not available',
-        'req.headers.forwarded': req.headers['forwarded'] || 'Not available'
+        'req.socket.remoteAddress': req.socket.remoteAddress || 'Not available'
     };
     
-    // Get server's network IPs
-    const serverIps = getNetworkIPs();
-    
-    // Clean up IP (remove port if present, handle IPv6 localhost)
-    let cleanIp = clientIp;
-    if (cleanIp.includes(':')) {
-        // Handle IPv6 localhost
-        if (cleanIp === '::1' || cleanIp === '::ffff:127.0.0.1') {
-            cleanIp = '127.0.0.1';
-        } else {
-            // Remove port if present
-            const parts = cleanIp.split(':');
-            if (parts.length === 2 && !isNaN(parts[1])) {
-                cleanIp = parts[0];
-            }
-        }
-    }
+    // Get geolocation info (approximate from IP)
+    const geoInfo = getGeoInfo(clientIp);
     
     console.log(`\n📱 IP SHOW REQUEST:`);
-    console.log(`   🌐 Client IP: ${cleanIp}`);
-    console.log(`   📊 Raw IP: ${clientIp}`);
-    console.log(`   🖥️  Server IPs: ${serverIps.join(', ')}`);
+    console.log(`   🌐 Client IP: ${clientIp}`);
+    console.log(`   📍 Location: ${geoInfo.city || 'Unknown'}, ${geoInfo.country || 'Unknown'}`);
     console.log(`   📋 All IP Sources:`, ipSources);
-    
-    // Check if client is localhost or network
-    const isLocalhost = cleanIp === '127.0.0.1' || cleanIp === '::1' || cleanIp === '::ffff:127.0.0.1';
     
     res.json({
         success: true,
         timestamp: new Date().toISOString(),
-        your_ip: cleanIp,
-        raw_ip: clientIp,
-        is_localhost: isLocalhost,
-        is_private_ip: isPrivateIp(cleanIp),
-        server_ips: serverIps,
-        access_instructions: {
-            from_same_pc: `http://localhost:${PORT}/ipshow`,
-            from_network: serverIps.map(ip => `http://${ip}:${PORT}/ipshow`),
-            from_other_devices: `Use one of the server_ips above`
+        client_info: {
+            ip: clientIp,
+            is_private: isPrivateIp(clientIp),
+            is_localhost: clientIp === '127.0.0.1' || clientIp === '::1',
+            ip_version: clientIp.includes(':') ? 'IPv6' : 'IPv4'
+        },
+        geo_location: geoInfo,
+        request_details: {
+            user_agent: req.headers['user-agent'] || 'Not available',
+            host: req.headers['host'] || 'Not available',
+            origin: req.headers['origin'] || 'Not available',
+            referer: req.headers['referer'] || 'Not available'
         },
         ip_sources: ipSources,
-        headers: {
-            'user-agent': req.headers['user-agent'] || 'Not available',
-            'host': req.headers['host'] || 'Not available'
-        },
         environment: process.env.NODE_ENV || 'development',
-        note: isLocalhost ? "⚠️ You're accessing from the same machine (localhost). Access from another device or use your network IP to see your actual IP." : "✅ You're accessing from a network IP"
+        server_info: {
+            server_time: new Date().toISOString(),
+            server_url: `https://${req.get('host')}`,
+            endpoint: '/ipshow'
+        }
     });
 });
+
+// Helper function to get approximate geolocation from IP
+function getGeoInfo(ip) {
+    // This is a simple mock - you can integrate with a real IP geolocation API
+    // For example: https://ipapi.co/json/ or https://ip-api.com/json/
+    if (isPrivateIp(ip) || ip === '127.0.0.1' || ip === '::1') {
+        return {
+            city: 'Local Network',
+            country: 'Private/Local',
+            region: 'Local',
+            timezone: 'Local',
+            isp: 'Local Network'
+        };
+    }
+    
+    // For public IPs, you can make an API call here
+    // For now, return basic info
+    return {
+        city: 'Unknown (Use IP Geolocation API)',
+        country: 'Unknown',
+        region: 'Unknown',
+        timezone: 'Unknown',
+        isp: 'Unknown',
+        note: 'Integrate with ipapi.co or ip-api.com for accurate geolocation'
+    };
+}
 
 // Helper function to check if IP is private
 function isPrivateIp(ip) {
     if (!ip) return false;
     
-    // Remove IPv6 prefix if present
+    // Clean up IP
     let cleanIp = ip.replace(/^::ffff:/, '');
     
     // Check private IP ranges
@@ -500,7 +520,7 @@ app.get('/data/export', async (req, res) => {
 // ============= WEBSOCKET FOR BRANCH OFFICES =============
 io.on('connection', (socket) => {
     const branchId = socket.id;
-    const clientIp = socket.handshake.address;
+    const clientIp = socket.handshake.address || socket.handshake.headers['x-forwarded-for'];
     
     console.log(`\n🔐 WEBSOCKET CONNECTION:`);
     console.log(`   📍 Client IP: ${clientIp}`);
@@ -591,16 +611,12 @@ io.on('connection', (socket) => {
 });
 
 // ============= START SERVER =============
-server.listen(PORT, '0.0.0.0', () => {  // Listen on all network interfaces
-    const networkIps = getNetworkIPs();
+server.listen(PORT, () => {
     console.log(`
     ═══════════════════════════════════════════════════════
     🌐 REMOTE RELAY SERVER (Cloud - No Local DB)
     ═══════════════════════════════════════════════════════
-    📍 Server Addresses:
-    ├─ Localhost:     http://localhost:${PORT}
-    ├─ Network IPs:   ${networkIps.map(ip => `http://${ip}:${PORT}`).join('\n    │               ')}
-    └─ Your PC IP:    ${networkIps.find(ip => ip.startsWith('172.20.')) || networkIps[0] || 'Not found'}
+    📍 Server URL:       ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
     
     🔌 RECEIVE STREAM FROM LOCAL PC:
     └─ POST /data/realtimedata
@@ -614,15 +630,17 @@ server.listen(PORT, '0.0.0.0', () => {  // Listen on all network interfaces
     ├─ GET  /data/history - Get update history
     ├─ GET  /data/export  - Export all data as JSON
     ├─ GET  /data/health  - Health check
-    ├─ GET  /ipshow       - Show your IP address
+    ├─ GET  /ipshow       - Show client IP address
     └─ WS   /             - WebSocket for real-time updates
     
-    🔐 AUTHENTICATION TESTING:
-    └─ All branch requests will log the client IP
-    └─ Check .env for ALLOWED_BRANCH_IPS configuration
+    📱 CLIENT IP DETECTION:
+    └─ GET /ipshow will show the IP of the requesting device
+    └─ Supports proxy headers (x-forwarded-for, x-real-ip, etc.)
     
-    📝 IMPORTANT: To see your actual IP (172.20.10.3), access from:
-    ${networkIps.map(ip => `    http://${ip}:${PORT}/ipshow`).join('\n    ')}
+    📊 Current Status:
+    ├─ Data received: ${latestData.count} records
+    ├─ Connected branches: ${connectedBranches.size}
+    └─ History size: ${dataHistory.length}
     
     ⚡ Waiting for local PC to send data via POST /data/realtimedata
     ═══════════════════════════════════════════════════════
