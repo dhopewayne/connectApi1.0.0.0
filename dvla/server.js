@@ -37,28 +37,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// ============= TEST AUTH MIDDLEWARE (LOGS IP ONLY) =============
-const authenticateBranch = (req, res, next) => {
-    // Get client IP from various sources (handles proxies)
-    const clientIp = getClientIp(req);
-    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? process.env.ALLOWED_BRANCH_IPS.split(',') : [];
-
-    console.log(`\n🔐 BRANCH AUTH CHECK:`);
-    console.log(`   📍 Client IP: ${clientIp}`);
-    console.log(`   📋 Allowed IPs: ${allowedIps.length > 0 ? allowedIps.join(', ') : 'No IPs configured'}`);
-    console.log(`   ✅ Auth Status: ${allowedIps.includes(clientIp) ? 'GRANTED ✅' : 'DENIED ❌'}`);
-    
-    // FOR TESTING: Always allow access but log everything
-    if (!allowedIps.includes(clientIp)) {
-        console.log(`   ⚠️  WARNING: IP ${clientIp} is NOT in the allowed list!`);
-        // Uncomment below to actually block access
-        // return res.status(403).json({ error: 'Unauthorized branch access' });
-    }
-    
-    next();
-};
-
-// Helper function to get client IP from various sources
+// ============= HELPER: Get Client IP =============
 function getClientIp(req) {
     // Check for forwarded IPs (when behind proxy/load balancer)
     const forwarded = req.headers['x-forwarded-for'];
@@ -93,7 +72,38 @@ function getClientIp(req) {
     return ip || 'Unknown IP';
 }
 
-// Apply authentication middleware to all branch endpoints
+// ============= AUTHENTICATION MIDDLEWARE =============
+const authenticateBranch = (req, res, next) => {
+    // Get the client's IP (this is the public IP when accessed from internet)
+    const clientIp = getClientIp(req);
+    
+    // Get allowed IPs from environment variable
+    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? 
+        process.env.ALLOWED_BRANCH_IPS.split(',').map(ip => ip.trim()) : 
+        [];
+    
+    console.log(`\n🔐 AUTHENTICATION CHECK:`);
+    console.log(`   📍 Client IP: ${clientIp}`);
+    console.log(`   📋 Allowed IPs: ${allowedIps.length > 0 ? allowedIps.join(', ') : 'None configured'}`);
+    
+    // Check if IP is allowed
+    const isAllowed = allowedIps.length === 0 || allowedIps.includes(clientIp);
+    
+    if (isAllowed) {
+        console.log(`   ✅ ACCESS GRANTED - IP is allowed`);
+        next();
+    } else {
+        console.log(`   ❌ ACCESS DENIED - IP not in allowed list`);
+        return res.status(403).json({
+            success: false,
+            error: 'Access denied. Your IP is not authorized.',
+            your_ip: clientIp,
+            timestamp: new Date().toISOString()
+        });
+    }
+};
+
+// ============= Apply Authentication to All Branch Endpoints =============
 app.use('/testresults', authenticateBranch);
 app.use('/data', authenticateBranch);
 
@@ -104,123 +114,60 @@ app.get('/', (req, res) => {
         status: 'online',
         version: '1.0.0',
         description: 'Receives data from local PC and relays to branch offices',
+        authentication: {
+            type: 'IP-based',
+            how_it_works: 'Your public IP must be in the ALLOWED_BRANCH_IPS list',
+            check_your_ip: 'GET /myip'
+        },
         endpoints: {
             receive_stream: 'POST /data/realtimedata (for local PC)',
-            get_all_data: 'GET /testresults',
-            get_paginated: 'GET /data/page?page=1&pageSize=100',
-            search: 'POST /data/search',
-            find_by_field: 'GET /data/find/:field/:value',
-            stats: 'GET /data/stats',
-            history: 'GET /data/history',
-            health: 'GET /data/health',
-            show_ip: 'GET /ipshow'
+            get_all_data: 'GET /testresults (requires authentication)',
+            get_paginated: 'GET /data/page?page=1&pageSize=100 (requires authentication)',
+            search: 'POST /data/search (requires authentication)',
+            find_by_field: 'GET /data/find/:field/:value (requires authentication)',
+            stats: 'GET /data/stats (requires authentication)',
+            history: 'GET /data/history (requires authentication)',
+            health: 'GET /data/health (public)',
+            check_my_ip: 'GET /myip (public)'
         },
         websocket: 'wss://' + req.get('host'),
         timestamp: new Date().toISOString()
     });
 });
 
-// ============= IP SHOW ENDPOINT =============
-app.get('/ipshow', (req, res) => {
-    // Get client IP using the helper function
+// ============= PUBLIC ENDPOINT: Check Your IP =============
+app.get('/myip', (req, res) => {
     const clientIp = getClientIp(req);
+    const allowedIps = process.env.ALLOWED_BRANCH_IPS ? 
+        process.env.ALLOWED_BRANCH_IPS.split(',').map(ip => ip.trim()) : 
+        [];
     
-    // Get all possible IP sources for debugging
-    const ipSources = {
-        'x-forwarded-for': req.headers['x-forwarded-for'] || 'Not available',
-        'x-real-ip': req.headers['x-real-ip'] || 'Not available',
-        'true-client-ip': req.headers['true-client-ip'] || 'Not available',
-        'cf-connecting-ip': req.headers['cf-connecting-ip'] || 'Not available',
-        'x-cluster-client-ip': req.headers['x-cluster-client-ip'] || 'Not available',
-        'req.ip': req.ip || 'Not available',
-        'req.connection.remoteAddress': req.connection.remoteAddress || 'Not available',
-        'req.socket.remoteAddress': req.socket.remoteAddress || 'Not available'
-    };
+    const isAllowed = allowedIps.length === 0 || allowedIps.includes(clientIp);
     
-    // Get geolocation info (approximate from IP)
-    const geoInfo = getGeoInfo(clientIp);
-    
-    console.log(`\n📱 IP SHOW REQUEST:`);
-    console.log(`   🌐 Client IP: ${clientIp}`);
-    console.log(`   📍 Location: ${geoInfo.city || 'Unknown'}, ${geoInfo.country || 'Unknown'}`);
-    console.log(`   📋 All IP Sources:`, ipSources);
+    console.log(`\n📱 IP CHECK REQUEST:`);
+    console.log(`   Client IP: ${clientIp}`);
+    console.log(`   Is Allowed: ${isAllowed}`);
     
     res.json({
         success: true,
         timestamp: new Date().toISOString(),
-        client_info: {
-            ip: clientIp,
-            is_private: isPrivateIp(clientIp),
-            is_localhost: clientIp === '127.0.0.1' || clientIp === '::1',
-            ip_version: clientIp.includes(':') ? 'IPv6' : 'IPv4'
+        your_public_ip: clientIp,
+        is_authorized: isAllowed,
+        allowed_ips: allowedIps,
+        message: isAllowed ? 
+            '✅ Your IP is authorized to access the endpoints' : 
+            '❌ Your IP is NOT authorized. Add it to ALLOWED_BRANCH_IPS in .env file',
+        how_to_allow: {
+            step1: 'Find your IP above (this is what the server sees)',
+            step2: 'Add it to ALLOWED_BRANCH_IPS in your .env file',
+            step3: 'Restart the server',
+            example: 'ALLOWED_BRANCH_IPS=154.161.48.219,203.45.67.89,192.168.1.100'
         },
-        geo_location: geoInfo,
-        request_details: {
-            user_agent: req.headers['user-agent'] || 'Not available',
-            host: req.headers['host'] || 'Not available',
-            origin: req.headers['origin'] || 'Not available',
-            referer: req.headers['referer'] || 'Not available'
-        },
-        ip_sources: ipSources,
-        environment: process.env.NODE_ENV || 'development',
-        server_info: {
-            server_time: new Date().toISOString(),
-            server_url: `https://${req.get('host')}`,
-            endpoint: '/ipshow'
-        }
+        note: 'This is your PUBLIC IP address (what the internet sees). Use this IP for authentication.'
     });
 });
 
-// Helper function to get approximate geolocation from IP
-function getGeoInfo(ip) {
-    // This is a simple mock - you can integrate with a real IP geolocation API
-    // For example: https://ipapi.co/json/ or https://ip-api.com/json/
-    if (isPrivateIp(ip) || ip === '127.0.0.1' || ip === '::1') {
-        return {
-            city: 'Local Network',
-            country: 'Private/Local',
-            region: 'Local',
-            timezone: 'Local',
-            isp: 'Local Network'
-        };
-    }
-    
-    // For public IPs, you can make an API call here
-    // For now, return basic info
-    return {
-        city: 'Unknown (Use IP Geolocation API)',
-        country: 'Unknown',
-        region: 'Unknown',
-        timezone: 'Unknown',
-        isp: 'Unknown',
-        note: 'Integrate with ipapi.co or ip-api.com for accurate geolocation'
-    };
-}
-
-// Helper function to check if IP is private
-function isPrivateIp(ip) {
-    if (!ip) return false;
-    
-    // Clean up IP
-    let cleanIp = ip.replace(/^::ffff:/, '');
-    
-    // Check private IP ranges
-    const privateRanges = [
-        /^10\./,           // 10.0.0.0/8
-        /^172\.1[6-9]\./,  // 172.16.0.0/12
-        /^172\.2[0-9]\./,  // 172.16.0.0/12
-        /^172\.3[0-1]\./,  // 172.16.0.0/12
-        /^192\.168\./,     // 192.168.0.0/16
-        /^127\./,          // 127.0.0.0/8 (localhost)
-        /^::1$/,           // IPv6 localhost
-        /^fc00:/,          // IPv6 private
-        /^fd00:/           // IPv6 private
-    ];
-    
-    return privateRanges.some(pattern => pattern.test(cleanIp));
-}
-
-// ============= HEALTH CHECK =============
+// ============= HEALTH CHECK (Public) =============
 app.get('/data/health', (req, res) => {
     res.json({
         status: 'online',
@@ -273,7 +220,7 @@ app.post('/data/realtimedata', async (req, res) => {
     });
     
     // Keep only last 50 updates
-    if (dataHistory.length > MAX_HISTORY) {
+    if (dataHistory.length > 50) {
         dataHistory.pop();
     }
     
@@ -307,7 +254,7 @@ app.post('/data/realtimedata', async (req, res) => {
     });
 });
 
-// ============= BRANCH OFFICE ENDPOINTS =============
+// ============= PROTECTED BRANCH OFFICE ENDPOINTS =============
 // Get all current data
 app.get('/testresults', async (req, res) => {
     console.log(`🏢 Branch requested all data`);     
@@ -462,7 +409,6 @@ app.get('/data/stats', async (req, res) => {
     
     const columns = Object.keys(latestData.records[0] || {});
     
-    // Calculate some basic stats
     const stats = {
         totalRecords: latestData.count,
         columns: columns,
@@ -614,35 +560,33 @@ io.on('connection', (socket) => {
 server.listen(PORT, () => {
     console.log(`
     ═══════════════════════════════════════════════════════
-    🌐 REMOTE RELAY SERVER (Cloud - No Local DB)
+    🌐 REMOTE RELAY SERVER WITH IP AUTHENTICATION
     ═══════════════════════════════════════════════════════
     📍 Server URL:       ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
     
-    🔌 RECEIVE STREAM FROM LOCAL PC:
-    └─ POST /data/realtimedata
+    🔐 AUTHENTICATION:
+    ├─ Type: IP-based authentication
+    ├─ Allowed IPs: ${process.env.ALLOWED_BRANCH_IPS || 'Not configured yet!'}
+    └─ Check your IP: GET /myip
     
-    🏢 BRANCH OFFICE ENDPOINTS:
-    ├─ GET  /testresults  - Get all current data
-    ├─ GET  /data/page    - Get paginated data
-    ├─ POST /data/search  - Search/filter records
-    ├─ GET  /data/find/:field/:value - Find by field
-    ├─ GET  /data/stats   - Get statistics
-    ├─ GET  /data/history - Get update history
-    ├─ GET  /data/export  - Export all data as JSON
-    ├─ GET  /data/health  - Health check
-    ├─ GET  /ipshow       - Show client IP address
-    └─ WS   /             - WebSocket for real-time updates
+    📡 ENDPOINTS:
+    ├─ PUBLIC:   GET  /myip          - Check your IP and authorization status
+    ├─ PUBLIC:   GET  /data/health   - Health check
+    ├─ PROTECTED: GET  /testresults  - Get all data
+    ├─ PROTECTED: GET  /data/page    - Get paginated data
+    ├─ PROTECTED: POST /data/search  - Search/filter records
+    ├─ PROTECTED: GET  /data/find/:field/:value - Find by field
+    ├─ PROTECTED: GET  /data/stats   - Get statistics
+    ├─ PROTECTED: GET  /data/history - Get update history
+    ├─ PROTECTED: GET  /data/export  - Export all data
+    └─ PROTECTED: WS   /             - WebSocket for real-time updates
     
-    📱 CLIENT IP DETECTION:
-    └─ GET /ipshow will show the IP of the requesting device
-    └─ Supports proxy headers (x-forwarded-for, x-real-ip, etc.)
-    
-    📊 Current Status:
-    ├─ Data received: ${latestData.count} records
-    ├─ Connected branches: ${connectedBranches.size}
-    └─ History size: ${dataHistory.length}
-    
-    ⚡ Waiting for local PC to send data via POST /data/realtimedata
+    📝 INSTRUCTIONS:
+    1. Visit GET /myip to see your public IP
+    2. Copy the IP shown
+    3. Add it to ALLOWED_BRANCH_IPS in .env file
+    4. Restart the server
+    5. Your IP is now authorized!
     ═══════════════════════════════════════════════════════
     `);
 });
