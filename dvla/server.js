@@ -97,7 +97,16 @@ const authenticateBranch = (req, res, next) => {
     console.log(`   ✅ Allowed MACs      : ${allowedMacs.length ? allowedMacs.join(', ') : 'Any (not set)'}`);
 
     // --- IP check ---
-    if (allowedIps.length > 0 && !allowedIps.includes(clientIp)) {
+    if (allowedIps.length === 0) {
+        console.log(`   ❌ No IPs whitelisted yet — access denied`);
+        return res.status(403).json({
+            success: false,
+            error:   'Access denied',
+            reason:  'No IPs have been whitelisted yet. POST to /allowed-ips first.'
+        });
+    }
+
+    if (!allowedIps.includes(clientIp)) {
         console.log(`   ❌ IP NOT ALLOWED: ${clientIp}`);
         return res.status(403).json({
             success: false,
@@ -139,9 +148,18 @@ app.use('/data',        authenticateBranch);
 // Hit this from any browser to see your public IP and whether you are allowed.
 app.get('/my-ip', (req, res) => {
     const ip      = getClientIp(req);
-    const allowed = allowedIps.length === 0 || allowedIps.includes(ip);
+    const allowed = allowedIps.includes(ip);
 
     console.log(`\n🌐 IP REQUEST — resolved: ${ip} | allowed: ${allowed}`);
+
+    if (allowedIps.length === 0) {
+        return res.status(403).json({
+            success:        false,
+            your_public_ip: ip,
+            access:         'DENIED',
+            message:        `❌ No IPs have been whitelisted yet. POST to /allowed-ips first.`
+        });
+    }
 
     if (allowed) {
         return res.json({
@@ -173,6 +191,18 @@ app.get('/allowed-ips', (req, res) => {
         allowed_ips: allowedIps,
         note:        allowedIps.length === 0
             ? 'List is empty — all IPs are currently allowed (open access)'
+            : 'Only these public IPs can access protected endpoints'
+    });
+});
+
+// ============= ENDPOINT: Allowed IPs =============
+app.get('/allowed-ips', (req, res) => {
+    res.json({
+        success:     true,
+        count:       allowedIps.length,
+        allowed_ips: allowedIps,
+        note:        allowedIps.length === 0
+            ? 'List is empty — ALL access is currently blocked until IPs are added'
             : 'Only these public IPs can access protected endpoints'
     });
 });
