@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io'); 
-const requestIp = require('request-ip');
 require('dotenv').config();
 
 const app = express();
@@ -38,47 +37,48 @@ app.use((req, res, next) => {
     next();
 });
 
-// ============= HELPER: Get Client IP =============
-// function getClientIp(req) {
-//     const forwarded = req.headers['x-forwarded-for'];
-//     if (forwarded) {
-//         const ips = forwarded.split(',');
-//         return ips[0].trim();
-//     }
-    
-//     const ip = req.headers['x-real-ip'] || 
-//                req.headers['true-client-ip'] ||
-//                req.headers['cf-connecting-ip'] ||
-//                req.ip ||
-//                req.connection.remoteAddress ||
-//                req.socket.remoteAddress;
-    
-//     if (ip === '::1' || ip === '::ffff:127.0.0.1') {
-//         return '127.0.0.1';
-//     }
-    
-//     if (ip && ip.includes(':')) {
-//         const parts = ip.split(':');
-//         if (parts.length === 2 && !isNaN(parts[1])) {
-//             return parts[0];
-//         }
-//     }
-    
-//     return ip || 'Unknown IP';
-// }
+// ============= HELPER: Get Real Client IP =============
+// Works behind reverse proxies (Render, Railway, Heroku, Nginx, Cloudflare, etc.)
+function getClientIp(req) {
+    // x-forwarded-for can be a comma-separated list: "clientIp, proxy1, proxy2"
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        return forwarded.split(',')[0].trim();
+    }
+
+    // Other common proxy headers
+    const realIp =
+        req.headers['x-real-ip'] ||
+        req.headers['true-client-ip'] ||
+        req.headers['cf-connecting-ip'];   // Cloudflare
+
+    if (realIp) return realIp.trim();
+
+    // Fallback to socket address
+    const raw =
+        req.socket?.remoteAddress ||
+        req.connection?.remoteAddress ||
+        'Unknown';
+
+    // Normalise IPv4-mapped IPv6 (::ffff:1.2.3.4 → 1.2.3.4)
+    if (raw.startsWith('::ffff:')) return raw.slice(7);
+    if (raw === '::1') return '127.0.0.1';
+
+    return raw;
+}
 
 // ============= AUTHENTICATION =============
 const authenticateBranch = (req, res, next) => {
-    const clientIp = getClientIp(req);
+    const clientIp  = getClientIp(req);
     const clientMac = req.headers['x-mac-address'];
     
-    const allowedMacs = process.env.ALLOWED_MACS ? 
-        process.env.ALLOWED_MACS.split(',').map(mac => mac.trim().toUpperCase()) : 
-        [];
+    const allowedMacs = process.env.ALLOWED_MACS
+        ? process.env.ALLOWED_MACS.split(',').map(m => m.trim().toUpperCase())
+        : [];
 
     console.log(`\n🔐 AUTHENTICATION CHECK:`);
     console.log(`   🖥️  Client MAC: ${clientMac || 'Not provided'}`);
-    console.log(`   📍 Client IP: ${clientIp}`);
+    console.log(`   📍 Client IP:  ${clientIp}`);
 
     if (!clientMac) {
         console.log(`   ❌ No MAC address provided`);
@@ -89,8 +89,9 @@ const authenticateBranch = (req, res, next) => {
         });
     }
 
-    const isAllowed = allowedMacs.length === 0 || allowedMacs.includes(clientMac.toUpperCase());
-    
+    const isAllowed = allowedMacs.length === 0 ||
+                      allowedMacs.includes(clientMac.toUpperCase());
+
     if (isAllowed) {
         console.log(`   ✅ ACCESS GRANTED`);
         next();
@@ -105,32 +106,47 @@ const authenticateBranch = (req, res, next) => {
 
 // Apply authentication
 app.use('/testresults', authenticateBranch);
-app.use('/data', authenticateBranch);
+app.use('/data',        authenticateBranch);
 
-// ============= ENDPOINT: Get MAC Address =============
+// ============= ENDPOINT: My MAC Address =============
+// The server cannot read the caller's MAC — it is a Layer 2 value
+// that never crosses routers. The client must send it in the
+// x-mac-address header (e.g. from a local script that reads the NIC).
+// This endpoint echoes it back so the client can confirm what was received.
 app.get('/my-mac', (req, res) => {
     const clientMac = req.headers['x-mac-address'];
-    
-    console.log(`\n📱 MAC REQUEST: ${clientMac || 'Not provided'}`);
-    
-    res.json({
-        mac: clientMac || 'Not available'
-    });
-});  
 
-app.get('/my-ip', (req, res) => {
-    const clientIP = requestIp.getClientIp(req);
-    
-    console.log(`\n🌐 IP REQUEST: ${clientIP || 'Not provided'}`);
-    
-    res.json({ 
-        ip: clientIP || 'Not available' 
+    console.log(`\n📱 MAC REQUEST — header value: ${clientMac || 'Not provided'}`);
+
+    if (!clientMac) {
+        return res.status(400).json({
+            success: false,
+            mac: null,
+            message: 'No MAC address received. Send your MAC in the x-mac-address request header.',
+            example: 'x-mac-address: AA:BB:CC:DD:EE:FF'
+        });
+    }
+
+    res.json({
+        success: true,
+        mac: clientMac.toUpperCase(),
+        message: 'MAC address received from x-mac-address header'
     });
 });
 
+// ============= ENDPOINT: My IP Address =============
+// Returns the real public IP of whoever is calling this endpoint.
+app.get('/my-ip', (req, res) => {
+    const clientIp = getClientIp(req);
 
+    console.log(`\n🌐 IP REQUEST — resolved IP: ${clientIp}`);
 
-
+    res.json({
+        success: true,
+        ip: clientIp,
+        message: 'This is the public IP address your request arrived from'
+    });
+});
 
 // ============= ROOT ENDPOINT =============
 app.get('/', (req, res) => {
@@ -140,46 +156,47 @@ app.get('/', (req, res) => {
         version: '1.0.0',
         endpoints: {
             receive_stream: 'POST /data/realtimedata',
-            get_all_data: 'GET /testresults',
-            get_paginated: 'GET /data/page?page=1&pageSize=100',
-            search: 'POST /data/search',
-            find_by_field: 'GET /data/find/:field/:value',
-            stats: 'GET /data/stats',
-            history: 'GET /data/history',
-            health: 'GET /data/health',
-            my_mac: 'GET /my-mac'
+            get_all_data:   'GET /testresults',
+            get_paginated:  'GET /data/page?page=1&pageSize=100',
+            search:         'POST /data/search',
+            find_by_field:  'GET /data/find/:field/:value',
+            stats:          'GET /data/stats',
+            history:        'GET /data/history',
+            health:         'GET /data/health',
+            my_mac:         'GET /my-mac  (send MAC in x-mac-address header)',
+            my_ip:          'GET /my-ip'
         },
-        websocket: 'wss://' + req.get('host'),
-        timestamp: new Date().toISOString()
+        websocket:  'wss://' + req.get('host'),
+        timestamp:  new Date().toISOString()
     });
 });
 
 // ============= HEALTH CHECK =============
 app.get('/data/health', (req, res) => {
     res.json({
-        status: 'online',
-        hasData: latestData.records.length > 0,
-        recordCount: latestData.count,
-        lastUpdate: latestData.lastUpdate,
+        status:            'online',
+        hasData:           latestData.records.length > 0,
+        recordCount:       latestData.count,
+        lastUpdate:        latestData.lastUpdate,
         connectedBranches: connectedBranches.size,
-        historySize: dataHistory.length,
-        timestamp: new Date().toISOString()
+        historySize:       dataHistory.length,
+        timestamp:         new Date().toISOString()
     });
 });
 
 // ============= RECEIVE STREAM FROM LOCAL PC =============
 app.post('/data/realtimedata', async (req, res) => {
     const { timestamp, records, count, source, table } = req.body;
-    const sourceSecret = req.headers['x-source-secret'];
+    const sourceSecret   = req.headers['x-source-secret'];
     const expectedSecret = process.env.REMOTE_SECRET;
     
     console.log(`\n📡 STREAM RECEIVED at ${new Date().toISOString()}`);
     console.log(`   Records: ${count || records?.length || 0}`);
-    console.log(`   Source: ${source || 'local_pc'}`);
-    console.log(`   Table: ${table || 'unknown'}`);
+    console.log(`   Source:  ${source || 'local_pc'}`);
+    console.log(`   Table:   ${table  || 'unknown'}`);
     
     if (expectedSecret && sourceSecret !== expectedSecret) {
-        console.log(`❌ Invalid secret - rejecting data`);
+        console.log(`❌ Invalid secret — rejecting data`);
         return res.status(401).json({ error: 'Invalid secret' });
     }
     
@@ -189,33 +206,31 @@ app.post('/data/realtimedata', async (req, res) => {
     }
     
     latestData = {
-        records: records,
+        records:    records,
         lastUpdate: new Date().toISOString(),
-        source: source || 'local_pc',
-        table: table || 'unknown',
-        count: records.length,
+        source:     source || 'local_pc',
+        table:      table  || 'unknown',
+        count:      records.length,
         receivedAt: timestamp
     };
     
     dataHistory.unshift({
-        timestamp: new Date().toISOString(),
+        timestamp:   new Date().toISOString(),
         recordCount: records.length,
-        source: source || 'local_pc'
+        source:      source || 'local_pc'
     });
     
-    if (dataHistory.length > MAX_HISTORY) {
-        dataHistory.pop();
-    }
+    if (dataHistory.length > MAX_HISTORY) dataHistory.pop();
     
     console.log(`✅ Data stored: ${records.length} records`);
     
     const broadcastPayload = {
-        type: 'live_update',
+        type:      'live_update',
         timestamp: new Date().toISOString(),
-        records: records,
-        count: records.length,
-        source: source || 'local_pc',
-        table: table || 'unknown'
+        records:   records,
+        count:     records.length,
+        source:    source || 'local_pc',
+        table:     table  || 'unknown'
     };
     
     let branchesNotified = 0;
@@ -227,70 +242,71 @@ app.post('/data/realtimedata', async (req, res) => {
     console.log(`📢 Broadcast to ${branchesNotified} connected branch offices`);
     
     res.json({ 
-        success: true, 
-        received: records.length,
-        stored: true,
+        success:          true, 
+        received:         records.length,
+        stored:           true,
         branchesNotified: branchesNotified,
-        timestamp: new Date().toISOString()
+        timestamp:        new Date().toISOString()
     });
 });
 
 // ============= BRANCH OFFICE ENDPOINTS =============
 app.get('/testresults', async (req, res) => {
-    console.log(`🏢 Branch requested all data`);     
+    console.log(`🏢 Branch requested all data`);
+    
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
-            statusCode: 200,
+            statusCode:    200,
             statusMessage: 'successful',
-            records: [],
-            message: 'No data available yet. Waiting for local PC to send data.'
+            records:       [],
+            message:       'No data available yet. Waiting for local PC to send data.'
         });
     }
     
     res.json({
-        success: true,
-        statusCode: 200,
+        success:       true,
+        statusCode:    200,
         statusMessage: 'OK',
-        records: latestData.records,
-        lastUpdate: latestData.lastUpdate,
-        source: latestData.source,
-        table: latestData.table
+        records:       latestData.records,
+        lastUpdate:    latestData.lastUpdate,
+        source:        latestData.source,
+        table:         latestData.table
     });
 }); 
 
 app.get('/data/page', async (req, res) => {
-    const page = parseInt(req.query.page) || 1;
-    const pageSize = Math.min(parseInt(req.query.pageSize) || 100, 1000);
+    const page      = parseInt(req.query.page)     || 1;
+    const pageSize  = Math.min(parseInt(req.query.pageSize) || 100, 1000);
     const startIndex = (page - 1) * pageSize;
     
     console.log(`🏢 Branch requested page ${page}, size ${pageSize}`);
     
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
-            success: true, 
-            statusCode: 200,
+            success:       true, 
+            statusCode:    200,
             statusMessage: 'OK',
-            records: [],
-            total: 0,
-            page: page,
-            pageSize: pageSize,
-            totalPages: 0,
-            message: 'No data available'
+            records:       [],
+            total:         0,
+            page,
+            pageSize,
+            totalPages:    0,
+            message:       'No data available'
         });
     }
     
     const paginatedRecords = latestData.records.slice(startIndex, startIndex + pageSize);
     
     res.json({
-        success: true,
-        statusCode: 200,
+        success:       true,
+        statusCode:    200,
         statusMessage: 'OK',
-        records: paginatedRecords,
-        total: latestData.count,
-        page: page,
-        pageSize: pageSize,
-        totalPages: Math.ceil(latestData.count / pageSize),
-        lastUpdate: latestData.lastUpdate
+        records:       paginatedRecords,
+        total:         latestData.count,
+        page,
+        pageSize,
+        totalPages:    Math.ceil(latestData.count / pageSize),
+        lastUpdate:    latestData.lastUpdate
     });
 });
 
@@ -302,42 +318,35 @@ app.post('/data/search', async (req, res) => {
     if (Object.keys(filters).length > 0) console.log(`   Filters:`, filters);
     
     if (!latestData.records || latestData.records.length === 0) {
-        return res.json({
-            success: true,
-            records: [],
-            count: 0,
-            message: 'No data available'
-        });
+        return res.json({ success: true, records: [], count: 0, message: 'No data available' });
     }
     
     let filteredRecords = [...latestData.records];
     
     if (searchTerm) {
         const term = searchTerm.toLowerCase();
-        filteredRecords = filteredRecords.filter(record => {
-            return Object.values(record).some(value => 
-                String(value).toLowerCase().includes(term)
-            );
-        });
+        filteredRecords = filteredRecords.filter(record =>
+            Object.values(record).some(v => String(v).toLowerCase().includes(term))
+        );
     }
     
-    if (filters && Object.keys(filters).length > 0) {
-        filteredRecords = filteredRecords.filter(record => {
-            return Object.entries(filters).every(([key, value]) => {
-                return String(record[key]).toLowerCase() === String(value).toLowerCase();
-            });
-        });
+    if (Object.keys(filters).length > 0) {
+        filteredRecords = filteredRecords.filter(record =>
+            Object.entries(filters).every(([key, value]) =>
+                String(record[key]).toLowerCase() === String(value).toLowerCase()
+            )
+        );
     }
     
     console.log(`✅ Found ${filteredRecords.length} matching records`);
     
     res.json({
-        success: true,
-        records: filteredRecords,
-        count: filteredRecords.length,
-        total: latestData.count,
+        success:    true,
+        records:    filteredRecords,
+        count:      filteredRecords.length,
+        total:      latestData.count,
         searchTerm: searchTerm || null,
-        filters: Object.keys(filters).length > 0 ? filters : null
+        filters:    Object.keys(filters).length > 0 ? filters : null
     });
 });
 
@@ -347,15 +356,10 @@ app.get('/data/find/:field/:value', async (req, res) => {
     console.log(`🏢 Branch searching: ${field} = ${value}`);
     
     if (!latestData.records || latestData.records.length === 0) {
-        return res.json({
-            success: true,
-            records: [],
-            count: 0,
-            message: 'No data available'
-        });
+        return res.json({ success: true, records: [], count: 0, message: 'No data available' });
     }
     
-    const matchedRecords = latestData.records.filter(record => 
+    const matchedRecords = latestData.records.filter(record =>
         String(record[field]).toUpperCase() === String(value).toUpperCase()
     );
     
@@ -364,9 +368,9 @@ app.get('/data/find/:field/:value', async (req, res) => {
     res.json({
         success: true,
         records: matchedRecords,
-        count: matchedRecords.length,
-        field: field,
-        value: value
+        count:   matchedRecords.length,
+        field,
+        value
     });
 });
 
@@ -383,19 +387,17 @@ app.get('/data/stats', async (req, res) => {
     
     const columns = Object.keys(latestData.records[0] || {});
     
-    const stats = {
-        totalRecords: latestData.count,
-        columns: columns,
-        columnCount: columns.length,
-        lastUpdate: latestData.lastUpdate,
-        source: latestData.source,
-        table: latestData.table
-    };
-    
     res.json({
         success: true,
         hasData: true,
-        stats: stats
+        stats: {
+            totalRecords: latestData.count,
+            columns,
+            columnCount:  columns.length,
+            lastUpdate:   latestData.lastUpdate,
+            source:       latestData.source,
+            table:        latestData.table
+        }
     });
 });
 
@@ -405,12 +407,12 @@ app.get('/data/history', async (req, res) => {
     console.log(`🏢 Branch requested history (last ${limit} updates)`);
     
     res.json({
-        success: true,
-        history: dataHistory.slice(0, limit),
+        success:      true,
+        history:      dataHistory.slice(0, limit),
         totalUpdates: dataHistory.length,
-        currentData: {
+        currentData:  {
             recordCount: latestData.count,
-            lastUpdate: latestData.lastUpdate
+            lastUpdate:  latestData.lastUpdate
         }
     });
 });
@@ -419,57 +421,56 @@ app.get('/data/export', async (req, res) => {
     console.log(`🏢 Branch requested data export`);
     
     if (!latestData.records || latestData.records.length === 0) {
-        return res.status(404).json({
-            success: false,
-            message: 'No data available to export'
-        });
+        return res.status(404).json({ success: false, message: 'No data available to export' });
     }
     
     res.json({
-        success: true,
-        exportedAt: new Date().toISOString(),
-        source: latestData.source,
-        table: latestData.table,
+        success:      true,
+        exportedAt:   new Date().toISOString(),
+        source:       latestData.source,
+        table:        latestData.table,
         totalRecords: latestData.count,
-        data: latestData.records
+        data:         latestData.records
     });
 });
 
 // ============= WEBSOCKET =============
 io.on('connection', (socket) => {
-    const branchId = socket.id;
-    const clientIp = socket.handshake.address || socket.handshake.headers['x-forwarded-for'];
+    const branchId  = socket.id;
+    const clientIp  = socket.handshake.headers['x-forwarded-for']?.split(',')[0].trim()
+                   || socket.handshake.address
+                   || 'Unknown';
     const clientMac = socket.handshake.headers['x-mac-address'] || 'Not provided';
     
     console.log(`\n🔐 WEBSOCKET CONNECTION:`);
     console.log(`   📍 Client IP: ${clientIp}`);
-    console.log(`   🖥️  MAC: ${clientMac}`);
+    console.log(`   🖥️  MAC:       ${clientMac}`);
     console.log(`   🆔 Socket ID: ${branchId}`);
     
     connectedBranches.set(branchId, socket);
     
     if (latestData.records && latestData.records.length > 0) {
         socket.emit('connected', {
-            status: 'connected',
-            message: 'Connected to data relay server',
+            status:      'connected',
+            message:     'Connected to data relay server',
             recordCount: latestData.count,
-            lastUpdate: latestData.lastUpdate,
-            hasData: true
+            lastUpdate:  latestData.lastUpdate,
+            hasData:     true
         });
         
         socket.emit('data_update', {
-            type: 'initial',
+            type:      'initial',
             timestamp: new Date().toISOString(),
-            records: latestData.records,
-            count: latestData.count,
-            source: latestData.source
+            records:   latestData.records,
+            count:     latestData.count,
+            source:    latestData.source
         });
         
         console.log(`📤 Sent initial data (${latestData.count} records) to branch ${branchId}`);
     } else {
         socket.emit('connected', {
-            status: 'connected',
-            message: 'Connected to data relay server - waiting for data from local PC',
+            status:  'connected',
+            message: 'Connected to data relay server — waiting for data from local PC',
             hasData: false
         });
     }
@@ -478,24 +479,20 @@ io.on('connection', (socket) => {
         console.log(`🔍 Branch ${branchId} requested filter:`, filters);
         
         if (!latestData.records || latestData.records.length === 0) {
-            socket.emit('filter_response', { 
-                records: [], 
-                count: 0,
-                message: 'No data available'
-            });
+            socket.emit('filter_response', { records: [], count: 0, message: 'No data available' });
             return;
         }
         
-        const filtered = latestData.records.filter(record => {
-            return Object.entries(filters).every(([key, value]) => {
-                return String(record[key]).toLowerCase().includes(String(value).toLowerCase());
-            });
-        });
+        const filtered = latestData.records.filter(record =>
+            Object.entries(filters).every(([key, value]) =>
+                String(record[key]).toLowerCase().includes(String(value).toLowerCase())
+            )
+        );
         
         socket.emit('filter_response', {
-            records: filtered,
-            count: filtered.length,
-            filters: filters,
+            records:   filtered,
+            count:     filtered.length,
+            filters,
             timestamp: new Date().toISOString()
         });
         
@@ -507,11 +504,11 @@ io.on('connection', (socket) => {
         
         if (latestData.records && latestData.records.length > 0) {
             socket.emit('data_update', {
-                type: 'refresh',
+                type:      'refresh',
                 timestamp: new Date().toISOString(),
-                records: latestData.records,
-                count: latestData.count,
-                source: latestData.source
+                records:   latestData.records,
+                count:     latestData.count,
+                source:    latestData.source
             });
         }
     });
@@ -532,8 +529,9 @@ server.listen(PORT, () => {
     ═══════════════════════════════════════════════════════
     🌐 REMOTE RELAY SERVER
     ═══════════════════════════════════════════════════════
-    📍 Server URL:       ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
-    📡 Endpoint:         GET /my-mac
+    📍 Server URL: ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
+    📡 GET /my-ip  — returns caller's public IP
+    📡 GET /my-mac — echoes x-mac-address header
     ═══════════════════════════════════════════════════════
     `);
 });
