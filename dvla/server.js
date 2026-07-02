@@ -32,13 +32,17 @@ let connectedBranches = new Map();
 let dataHistory = [];
 const MAX_HISTORY = 50;
 
-// ============= WHITELIST CONFIGURATION =============
-let whitelistedNetworks = process.env.WHITELISTED_NETWORKS
-    ? process.env.WHITELISTED_NETWORKS.split(',').map(network => network.trim()).filter(Boolean)
-    : [];
+// ============= TRACK ALL PCs ACCESSING THE SERVER =============
+// Store information about every PC that accesses the server
+let pcAccessLog = new Map(); // Key: client_ip, Value: PC info
 
+// ============= WHITELIST CONFIGURATION =============
 let whitelistedStaticIps = process.env.WHITELISTED_STATIC_IPS
     ? process.env.WHITELISTED_STATIC_IPS.split(',').map(ip => ip.trim()).filter(Boolean)
+    : [];
+
+let whitelistedNetworks = process.env.WHITELISTED_NETWORKS
+    ? process.env.WHILISTED_NETWORKS.split(',').map(network => network.trim()).filter(Boolean)
     : [];
 
 // ============= LOGGING =============
@@ -47,405 +51,315 @@ app.use((req, res, next) => {
     next();
 });
 
-// ============= HELPER: Get Client IP from Headers =============
-function getClientIp(req) {
-    const candidates = [
-        req.headers['cf-connecting-ip'],
-        req.headers['x-forwarded-for'],
-        req.headers['x-real-ip'],
-        req.headers['true-client-ip'],
-        req.headers['x-client-ip'],
-        req.socket && req.socket.remoteAddress,
-        req.connection && req.connection.remoteAddress
-    ];
-
-    for (let i = 0; i < candidates.length; i++) {
-        const raw = candidates[i];
-        if (!raw) continue;
-        const ip = raw.split(',')[0].trim();
-        if (!ip) continue;
-        if (ip.startsWith('::ffff:')) return ip.slice(7);
-        if (ip === '::1') return '127.0.0.1';
-        return ip;
+// ============= MIDDLEWARE: Track All PCs =============
+app.use((req, res, next) => {
+    const networkInfo = getClientNetworkInfo(req);
+    const clientIp = networkInfo.client_ip;
+    
+    if (clientIp && clientIp !== 'Unknown' && clientIp !== '127.0.0.1') {
+        // Check if this PC already exists
+        if (!pcAccessLog.has(clientIp)) {
+            // New PC detected
+            pcAccessLog.set(clientIp, {
+                first_seen: new Date().toISOString(),
+                last_seen: new Date().toISOString(),
+                total_requests: 0,
+                ip_chain: networkInfo.ip_chain,
+                socket_ip: networkInfo.socket.remoteAddress,
+                user_agent: networkInfo.user_agent,
+                host: networkInfo.host,
+                is_whitelisted: false,
+                request_history: []
+            });
+            console.log(`🆕 NEW PC DETECTED: ${clientIp}`);
+        }
+        
+        // Update existing PC record
+        const pcRecord = pcAccessLog.get(clientIp);
+        pcRecord.last_seen = new Date().toISOString();
+        pcRecord.total_requests += 1;
+        pcRecord.ip_chain = networkInfo.ip_chain;
+        pcRecord.socket_ip = networkInfo.socket.remoteAddress;
+        pcRecord.user_agent = networkInfo.user_agent || pcRecord.user_agent;
+        pcRecord.host = networkInfo.host || pcRecord.host;
+        
+        // Check if whitelisted
+        pcRecord.is_whitelisted = isIpWhitelisted(clientIp);
+        
+        // Store request history (keep last 10)
+        pcRecord.request_history.push({
+            timestamp: new Date().toISOString(),
+            method: req.method,
+            url: req.originalUrl,
+            status: 'pending'
+        });
+        if (pcRecord.request_history.length > 10) {
+            pcRecord.request_history.shift();
+        }
+        
+        // Update the map
+        pcAccessLog.set(clientIp, pcRecord);
     }
+    
+    next();
+});
 
-    return 'Unknown';
+// ============= HELPER: Get Client PC Network Information =============
+function getClientNetworkInfo(req) {
+    const forwarded = req.headers['x-forwarded-for'];
+    const xRealIp = req.headers['x-real-ip'];
+    const cfConnectingIp = req.headers['cf-connecting-ip'];
+    const socketIp = req.socket?.remoteAddress || req.connection?.remoteAddress;
+    
+    let ipChain = [];
+    if (forwarded) {
+        ipChain = forwarded.split(',').map(ip => ip.trim());
+    }
+    
+    let clientIp = null;
+    if (ipChain.length > 0) {
+        clientIp = ipChain[0];
+    } else if (cfConnectingIp) {
+        clientIp = cfConnectingIp;
+    } else if (xRealIp) {
+        clientIp = xRealIp;
+    } else if (socketIp) {
+        clientIp = socketIp;
+    }
+    
+    if (clientIp === '::1' || clientIp === '::ffff:127.0.0.1') {
+        clientIp = '127.0.0.1';
+    }
+    
+    return {
+        client_ip: clientIp || 'Unknown',
+        ip_chain: ipChain,
+        headers: {
+            'x-forwarded-for': forwarded || null,
+            'x-real-ip': xRealIp || null,
+            'cf-connecting-ip': cfConnectingIp || null,
+            'x-client-ip': req.headers['x-client-ip'] || null,
+            'x-forwarded-host': req.headers['x-forwarded-host'] || null,
+            'x-forwarded-proto': req.headers['x-forwarded-proto'] || null,
+            'x-forwarded-port': req.headers['x-forwarded-port'] || null,
+        },
+        socket: {
+            remoteAddress: socketIp || null,
+            remotePort: req.socket?.remotePort || req.connection?.remotePort || null,
+            localAddress: req.socket?.localAddress || req.connection?.localAddress || null,
+            localPort: req.socket?.localPort || req.connection?.localPort || null,
+        },
+        user_agent: req.headers['user-agent'] || null,
+        host: req.headers['host'] || null,
+        origin: req.headers['origin'] || null,
+        referer: req.headers['referer'] || null,
+    };
 }
 
-// ============= HELPER: Check if IP is in private range =============
-function isIpInPrivateRange(ip) {
+// ============= HELPER: Check if IP is whitelisted =============
+function isIpWhitelisted(ip) {
     if (!ip || ip === 'Unknown') return false;
     
-    const parts = ip.split('.').map(Number);
-    if (parts.length !== 4) return false;
-    if (parts.some(isNaN)) return false;
+    if (whitelistedStaticIps.includes(ip)) return true;
     
-    // 10.0.0.0/8
-    if (parts[0] === 10) return true;
-    
-    // 172.16.0.0/12
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    
-    // 192.168.0.0/16
-    if (parts[0] === 192 && parts[1] === 168) return true;
-    
-    // 127.0.0.0/8
-    if (parts[0] === 127) return true;
+    if (whitelistedNetworks.length > 0) {
+        for (const network of whitelistedNetworks) {
+            if (isIpInNetwork(ip, network)) {
+                return true;
+            }
+        }
+    }
     
     return false;
 }
 
-// ============= HELPER: Check if IP is in whitelisted network =============
-function isIpInWhitelistedNetwork(ip) {
-    if (!ip || whitelistedNetworks.length === 0) return false;
+// ============= HELPER: Check if IP is in network range =============
+function isIpInNetwork(ip, cidr) {
+    if (!ip || !cidr) return false;
+    
+    const [network, maskBits] = cidr.split('/');
+    if (!network || !maskBits) return false;
     
     const ipParts = ip.split('.').map(Number);
-    if (ipParts.length !== 4 || ipParts.some(isNaN)) return false;
+    const networkParts = network.split('.').map(Number);
     
-    for (const whitelisted of whitelistedNetworks) {
-        const [network, maskBits] = whitelisted.split('/');
-        if (!network || !maskBits) continue;
-        
-        const networkParts = network.split('.').map(Number);
-        if (networkParts.length !== 4 || networkParts.some(isNaN)) continue;
-        
-        const mask = parseInt(maskBits);
-        const cidrMask = ~0 << (32 - mask);
-        
-        const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
-        const networkNum = (networkParts[0] << 24) | (networkParts[1] << 16) | (networkParts[2] << 8) | networkParts[3];
-        
-        if ((ipNum & cidrMask) === (networkNum & cidrMask)) {
-            return true;
-        }
-    }
+    if (ipParts.length !== 4 || networkParts.length !== 4) return false;
+    if (ipParts.some(isNaN) || networkParts.some(isNaN)) return false;
     
-    return false;
+    const mask = parseInt(maskBits);
+    const cidrMask = ~0 << (32 - mask);
+    
+    const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
+    const networkNum = (networkParts[0] << 24) | (networkParts[1] << 16) | (networkParts[2] << 8) | networkParts[3];
+    
+    return (ipNum & cidrMask) === (networkNum & cidrMask);
 }
 
-// ============= HELPER: Get Network Info with Router ID =============
-// function getNetworkInfo(ip) {
-//     const info = {
-//         ip: ip,
-//         router_id: null,
-//         network_range: null,
-//         is_private: false,
-//         is_whitelisted: false,
-//         whitelist_method: null,
-//         network_type: 'unknown'
-//     };
-
-//     // Check if private
-//     info.is_private = isIpInPrivateRange(ip);
-
-//     // Get router ID (Gateway) - typically .1 in the subnet
-//     if (ip && ip !== 'Unknown') {
-//         const parts = ip.split('.');
-//         if (parts.length === 4) {
-//             // Router is usually .1 or .254 in the subnet
-//             // Try .1 first (most common)
-//             info.router_id = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
-            
-//             // Get network range
-//             info.network_range = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
-//         }
-//     }
-
-//     // Check if IP is whitelisted (static IP)
-//     if (whitelistedStaticIps.includes(ip)) {
-//         info.is_whitelisted = true;
-//         info.whitelist_method = 'Static IP';
-//         return info;
-//     }
-
-//     // Check if IP is in whitelisted network
-//     if (isIpInWhitelistedNetwork(ip)) {
-//         info.is_whitelisted = true;
-//         info.whitelist_method = 'Network Range';
-//         return info;
-//     }
-
-//     // Determine network type
-//     if (info.is_private) {
-//         if (ip.startsWith('192.168.')) {
-//             info.network_type = 'Private (Class C)';
-//         } else if (ip.startsWith('10.')) {
-//             info.network_type = 'Private (Class A)';
-//         } else if (ip.startsWith('172.')) {
-//             info.network_type = 'Private (Class B)';
-//         } else if (ip.startsWith('127.')) {
-//             info.network_type = 'Localhost';
-//         }
-//     } else {
-//         info.network_type = 'Public';
-//     }
-
-//     return info;
-// }
-
-// ============= ENDPOINT: Check My Network Status =============
-// This is the endpoint you hit from your company PC
-// It shows your local PC IP, router ID, and if you're whitelisted
-// app.get('/my-network-check', (req, res) => {
-//     const clientIp = getClientIp(req);
-//     const networkInfo = getNetworkInfo(clientIp);
+// ============= ENDPOINT: Show All PCs Accessing the Server =============
+app.get('/all-pcs', (req, res) => {
+    // Convert Map to array for response
+    const allPCs = [];
+    let whitelistedCount = 0;
+    let totalRequests = 0;
     
-//     console.log(`\n🖥️ NETWORK CHECK from ${clientIp}`);
-//     console.log(`   Router ID: ${networkInfo.router_id}`);
-//     console.log(`   Whitelisted: ${networkInfo.is_whitelisted}`);
+    for (const [ip, info] of pcAccessLog) {
+        allPCs.push({
+            ip: ip,
+            ...info
+        });
+        if (info.is_whitelisted) whitelistedCount++;
+        totalRequests += info.total_requests;
+    }
     
-//     // Get all network interfaces for this PC (server-side)
-//     const serverInterfaces = getServerNetworkInterfaces();
-    
-//     res.json({
-//         success: true,
-//         your_network: {
-//             // Your PC's local IP (what the server sees)
-//             local_pc_ip: clientIp,
-            
-//             // Your router/gateway ID
-//             router_id: networkInfo.router_id,
-            
-//             // Your network range
-//             network_range: networkInfo.network_range,
-            
-//             // Network type
-//             network_type: networkInfo.network_type,
-            
-//             // Is this a private network?
-//             is_private: networkInfo.is_private,
-            
-//             // Are you whitelisted?
-//             is_whitelisted: networkInfo.is_whitelisted,
-            
-//             // How you're whitelisted (if applicable)
-//             whitelist_method: networkInfo.whitelist_method
-//         },
-        
-//         whitelist_status: {
-//             status: networkInfo.is_whitelisted ? '✅ ALLOWED' : '❌ DENIED',
-//             message: networkInfo.is_whitelisted 
-//                 ? `Your PC (${clientIp}) is authorized to access this server`
-//                 : `Your PC (${clientIp}) is NOT authorized to access this server`
-//         },
-        
-//         // Server's network info for reference
-//         server_network: {
-//             server_local_ips: serverInterfaces,
-//             whitelisted_networks: whitelistedNetworks,
-//             whitelisted_static_ips: whitelistedStaticIps
-//         },
-        
-//         // Helpful actions
-//         actions: {
-//             if_not_whitelisted: {
-//                 method_1: `Add your IP as static: WHITELISTED_STATIC_IPS=${clientIp}`,
-//                 method_2: `Add your network: WHITELISTED_NETWORKS=${networkInfo.network_range || '192.168.1.0/24'}`,
-//                 method_3: `POST to /whitelist/static with: { "ips": ["${clientIp}"] }`,
-//                 method_4: `POST to /whitelist/network with: { "networks": ["${networkInfo.network_range || '192.168.1.0/24'}"] }`
-//             }
-//         },
-        
-//         timestamp: new Date().toISOString()
-//     });
-// });  
-
-
-
-
-
-
-// ============= HELPER: Get Network Info with Better Detection =============
-function getNetworkInfo(ip) {
-    const info = {
-        ip: ip,
-        router_id: null,
-        network_range: null,
-        subnet_mask: null,
-        is_private: false,
-        is_whitelisted: false,
-        whitelist_method: null,
-        network_type: 'unknown',
-        recommendation: null
-    };
-
-    // Check if private
-    info.is_private = isIpInPrivateRange(ip);
-
-    // Get network details
-    if (ip && ip !== 'Unknown') {
-        const parts = ip.split('.');
-        if (parts.length === 4) {
-            // Router is usually .1 in the subnet
-            info.router_id = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
-            
-            // Network range
-            info.network_range = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
-            
-            // Subnet mask (default for /24)
-            info.subnet_mask = '255.255.255.0';
-        }
-    }
-
-    // Check if IP is whitelisted (static IP)
-    if (whitelistedStaticIps.includes(ip)) {
-        info.is_whitelisted = true;
-        info.whitelist_method = 'Static IP (Recommended for your setup)';
-        info.recommendation = 'Your IP is whitelisted as a static IP';
-        return info;
-    }
-
-    // Check if IP is in whitelisted network
-    if (isIpInWhitelistedNetwork(ip)) {
-        info.is_whitelisted = true;
-        info.whitelist_method = 'Network Range';
-        info.recommendation = 'Your network is whitelisted';
-        return info;
-    }
-
-    // Determine network type and recommendation
-    if (info.is_private) {
-        if (ip.startsWith('192.168.')) {
-            info.network_type = 'Private (Class C - Home/Office)';
-            info.recommendation = 'Add your network range or static IP';
-        } else if (ip.startsWith('10.')) {
-            info.network_type = 'Private (Class A - Large Network)';
-            info.recommendation = 'Add your network range or static IP';
-        } else if (ip.startsWith('172.')) {
-            info.network_type = 'Private (Class B - Medium Network)';
-            info.recommendation = 'Add your network range or static IP';
-        }
-    } else {
-        info.network_type = `Public IP (${ip}) - Likely a Company Static IP`;
-        info.recommendation = 'Since this is a public static IP, add it as a STATIC IP, not a network range';
-    }
-
-    return info;
-}
-
-// ============= ENDPOINT: Check My Network Status (Enhanced) =============
-app.get('/my-network-check', (req, res) => {
-    const clientIp = getClientIp(req);
-    const networkInfo = getNetworkInfo(clientIp);
-    
-    console.log(`\n🖥️ NETWORK CHECK from ${clientIp}`);
-    console.log(`   Router ID: ${networkInfo.router_id}`);
-    console.log(`   Whitelisted: ${networkInfo.is_whitelisted}`);
-    console.log(`   Network Type: ${networkInfo.network_type}`);
+    // Sort by last_seen (most recent first)
+    allPCs.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
     
     res.json({
         success: true,
-        your_network: {
-            // Your PC's IP
-            local_pc_ip: clientIp,
-            
-            // Your router/gateway
-            router_id: networkInfo.router_id,
-            
-            // Your network range
-            network_range: networkInfo.network_range,
-            
-            // Subnet mask
-            subnet_mask: networkInfo.subnet_mask,
-            
-            // Network type
-            network_type: networkInfo.network_type,
-            
-            // Is this a private network?
-            is_private: networkInfo.is_private,
-            
-            // Are you whitelisted?
-            is_whitelisted: networkInfo.is_whitelisted,
-            
-            // How you're whitelisted (if applicable)
-            whitelist_method: networkInfo.whitelist_method,
-            
-            // Recommendation
-            recommendation: networkInfo.recommendation
+        summary: {
+            total_pcs: allPCs.length,
+            whitelisted_pcs: whitelistedCount,
+            unwhitelisted_pcs: allPCs.length - whitelistedCount,
+            total_requests: totalRequests,
+            last_updated: new Date().toISOString()
         },
-        
-        whitelist_status: {
-            status: networkInfo.is_whitelisted ? '✅ ALLOWED' : '❌ DENIED',
-            message: networkInfo.is_whitelisted 
-                ? `Your PC (${clientIp}) is authorized to access this server`
-                : `Your PC (${clientIp}) is NOT authorized to access this server`
-        },
-        
-        // ⭐ IMPORTANT: Based on your network type, this shows the BEST method
-        recommended_action: networkInfo.is_private ? {
-            method: 'Network Range (CIDR)',
-            value: networkInfo.network_range,
-            command: `curl -X POST /whitelist/network -H "Content-Type: application/json" -d '{"networks": ["${networkInfo.network_range}"]}'`,
-            note: 'Use network range if other PCs in your company need access'
-        } : {
-            method: 'Static IP (Recommended for your setup)',
-            value: clientIp,
-            command: `curl -X POST /whitelist/static -H "Content-Type: application/json" -d '{"ips": ["${clientIp}"]}'`,
-            note: 'Use static IP since your IP is public and fixed'
-        },
-        
-        // All possible actions
-        actions: {
-            // For static IP (RECOMMENDED for you)
-            add_static_ip: {
-                method: `Add your IP as a static IP`,
-                value: clientIp,
-                command: `curl -X POST /whitelist/static -H "Content-Type: application/json" -d '{"ips": ["${clientIp}"]}'`,
-                why: 'Your IP is public and static - this is the most secure method'
-            },
-            
-            // For network range (if others need access)
-            add_network_range: {
-                method: `Add your network range`,
-                value: networkInfo.network_range,
-                command: `curl -X POST /whitelist/network -H "Content-Type: application/json" -d '{"networks": ["${networkInfo.network_range}"]}'`,
-                why: 'Use this if other PCs in your company need access (IPs in the same range)'
-            },
-            
-            // Environment variable method
-            env_method: {
-                static_ip: `WHITELISTED_STATIC_IPS=${clientIp}`,
-                network_range: `WHILISTED_NETWORKS=${networkInfo.network_range}`
-            }
-        },
-        
-        // Server's current whitelist
-        server_whitelist: {
+        pcs: allPCs,
+        whitelist: {
             static_ips: whitelistedStaticIps,
             networks: whitelistedNetworks
         },
-        
         timestamp: new Date().toISOString()
     });
 });
 
-// ============= HELPER: Get Server Network Interfaces =============
-function getServerNetworkInterfaces() {
-    try {
-        const interfaces = os.networkInterfaces();
-        const results = [];
-        
-        for (const name of Object.keys(interfaces)) {
-            for (const iface of interfaces[name]) {
-                if (!iface.internal && iface.family === 'IPv4') {
-                    results.push({
-                        interface: name,
-                        address: iface.address,
-                        netmask: iface.netmask
-                    });
-                }
-            }
-        }
-        
-        return results;
-    } catch (error) {
-        return [];
+// ============= ENDPOINT: Show Specific PC Details =============
+app.get('/pc/:ip', (req, res) => {
+    const ip = req.params.ip;
+    
+    if (!pcAccessLog.has(ip)) {
+        return res.status(404).json({
+            success: false,
+            error: 'PC not found',
+            message: `No PC with IP ${ip} has accessed this server`
+        });
     }
-}
+    
+    const pcInfo = pcAccessLog.get(ip);
+    
+    res.json({
+        success: true,
+        pc: {
+            ip: ip,
+            ...pcInfo
+        },
+        timestamp: new Date().toISOString()
+    });
+});
 
-// ============= WHITELIST MANAGEMENT ENDPOINTS =============
+// ============= ENDPOINT: Clear PC Access Log =============
+app.delete('/all-pcs', (req, res) => {
+    const count = pcAccessLog.size;
+    pcAccessLog.clear();
+    
+    console.log(`🗑️ PC access log cleared (${count} PCs removed)`);
+    
+    res.json({
+        success: true,
+        message: `Cleared PC access log`,
+        removed_count: count,
+        timestamp: new Date().toISOString()
+    });
+});
 
-// GET - View whitelist
+// ============= ENDPOINT: Show PC Network Info =============
+app.get('/my-pc-check', (req, res) => {
+    const networkInfo = getClientNetworkInfo(req);
+    const clientIp = networkInfo.client_ip;
+    
+    console.log(`\n🖥️ PC CHECK from ${clientIp}`);
+    console.log(`   IP Chain: ${networkInfo.ip_chain.join(' -> ')}`);
+    console.log(`   Socket IP: ${networkInfo.socket.remoteAddress}`);
+    
+    const isWhitelisted = isIpWhitelisted(clientIp);
+    const pcHistory = pcAccessLog.get(clientIp);
+    
+    res.json({
+        success: true,
+        your_pc_network_info: {
+            client_ip: clientIp,
+            ip_chain: networkInfo.ip_chain,
+            socket: {
+                remote_address: networkInfo.socket.remoteAddress,
+                remote_port: networkInfo.socket.remotePort,
+                local_address: networkInfo.socket.localAddress,
+                local_port: networkInfo.socket.localPort
+            },
+            headers: networkInfo.headers,
+            user_agent: networkInfo.user_agent,
+            host: networkInfo.host,
+            origin: networkInfo.origin,
+            is_whitelisted: isWhitelisted,
+            total_requests: pcHistory?.total_requests || 0,
+            first_seen: pcHistory?.first_seen || null,
+            last_seen: pcHistory?.last_seen || null
+        },
+        whitelist_status: {
+            status: isWhitelisted ? '✅ AUTHORIZED' : '❌ NOT AUTHORIZED',
+            message: isWhitelisted 
+                ? `Your PC (${clientIp}) is authorized to access this server`
+                : `Your PC (${clientIp || 'unknown'}) is NOT authorized to access this server`
+        },
+        server_whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ============= AUTHENTICATION =============
+const authenticateBranch = (req, res, next) => {
+    const networkInfo = getClientNetworkInfo(req);
+    const clientIp = networkInfo.client_ip;
+    
+    console.log(`\n🔐 AUTH CHECK:`);
+    console.log(`   📍 Client IP: ${clientIp}`);
+    console.log(`   🔗 IP Chain: ${networkInfo.ip_chain.join(' -> ') || 'None'}`);
+    
+    if (!clientIp || clientIp === 'Unknown') {
+        console.log(`   ❌ No IP detected`);
+        return res.status(401).json({
+            success: false,
+            error: 'Unable to identify client IP'
+        });
+    }
+    
+    const isAuthorized = isIpWhitelisted(clientIp);
+    
+    if (!isAuthorized) {
+        console.log(`   ❌ ACCESS DENIED`);
+        return res.status(403).json({
+            success: false,
+            error: 'Access denied',
+            reason: 'Your PC is not authorized to access this server',
+            your_ip: clientIp,
+            whitelisted_ips: whitelistedStaticIps,
+            whitelisted_networks: whitelistedNetworks,
+            how_to_fix: {
+                method_1: `Add your IP to .env: WHITELISTED_STATIC_IPS=${clientIp}`,
+                method_2: `POST to /whitelist/static with: { "ips": ["${clientIp}"] }`
+            }
+        });
+    }
+    
+    console.log(`   ✅ ACCESS GRANTED`);
+    req.networkInfo = networkInfo;
+    req.clientIp = clientIp;
+    next();
+};
+
+// ============= WHITELIST MANAGEMENT =============
+
 app.get('/whitelist', (req, res) => {
     res.json({
         success: true,
@@ -455,22 +369,19 @@ app.get('/whitelist', (req, res) => {
         },
         counts: {
             static_ips: whitelistedStaticIps.length,
-            networks: whitelistedNetworks.length,
-            total: whitelistedStaticIps.length + whitelistedNetworks.length
+            networks: whitelistedNetworks.length
         }
     });
 });
 
-// POST - Add static IPs
 app.post('/whitelist/static', (req, res) => {
     const { ips } = req.body;
-    const clientIp = getClientIp(req);
-
+    
     if (!ips) {
         return res.status(400).json({
             success: false,
             error: 'Missing field: ips',
-            example: { ips: ['192.168.1.100'] }
+            example: { ips: ['192.168.1.100', '10.0.0.5'] }
         });
     }
 
@@ -484,6 +395,12 @@ app.post('/whitelist/static', (req, res) => {
         if (!whitelistedStaticIps.includes(ip)) {
             whitelistedStaticIps.push(ip);
             added.push(ip);
+            // Update PC record if exists
+            if (pcAccessLog.has(ip)) {
+                const record = pcAccessLog.get(ip);
+                record.is_whitelisted = true;
+                pcAccessLog.set(ip, record);
+            }
         } else {
             alreadyExist.push(ip);
         }
@@ -498,7 +415,6 @@ app.post('/whitelist/static', (req, res) => {
     });
 });
 
-// POST - Add network ranges
 app.post('/whitelist/network', (req, res) => {
     const { networks } = req.body;
 
@@ -520,6 +436,13 @@ app.post('/whitelist/network', (req, res) => {
         if (!whitelistedNetworks.includes(network)) {
             whitelistedNetworks.push(network);
             added.push(network);
+            // Update all PC records that are in this network
+            for (const [ip, record] of pcAccessLog) {
+                if (isIpInNetwork(ip, network)) {
+                    record.is_whitelisted = true;
+                    pcAccessLog.set(ip, record);
+                }
+            }
         } else {
             alreadyExist.push(network);
         }
@@ -534,7 +457,6 @@ app.post('/whitelist/network', (req, res) => {
     });
 });
 
-// DELETE - Remove from whitelist
 app.delete('/whitelist', (req, res) => {
     const { type, value } = req.body;
 
@@ -553,12 +475,23 @@ app.delete('/whitelist', (req, res) => {
         if (index !== -1) {
             whitelistedStaticIps.splice(index, 1);
             removed = true;
+            // Update PC record
+            if (pcAccessLog.has(value)) {
+                const record = pcAccessLog.get(value);
+                record.is_whitelisted = false;
+                pcAccessLog.set(value, record);
+            }
         }
     } else if (type === 'network') {
         const index = whitelistedNetworks.indexOf(value);
         if (index !== -1) {
             whitelistedNetworks.splice(index, 1);
             removed = true;
+            // Re-check all PCs
+            for (const [ip, record] of pcAccessLog) {
+                record.is_whitelisted = isIpWhitelisted(ip);
+                pcAccessLog.set(ip, record);
+            }
         }
     }
 
@@ -580,43 +513,14 @@ app.delete('/whitelist', (req, res) => {
 });
 
 // ============= PROTECTED ENDPOINTS =============
-// Authentication middleware
-const authenticateBranch = (req, res, next) => {
-    const clientIp = getClientIp(req);
-    const networkInfo = getNetworkInfo(clientIp);
-
-    console.log(`\n🔐 AUTH CHECK:`);
-    console.log(`   IP: ${clientIp}`);
-    console.log(`   Router: ${networkInfo.router_id}`);
-    console.log(`   Whitelisted: ${networkInfo.is_whitelisted}`);
-
-    if (!networkInfo.is_whitelisted) {
-        return res.status(403).json({
-            success: false,
-            error: 'Access denied',
-            reason: 'Your network is not whitelisted',
-            your_ip: clientIp,
-            router_id: networkInfo.router_id,
-            network_range: networkInfo.network_range,
-            how_to_fix: {
-                add_static_ip: `POST /whitelist/static with { "ips": ["${clientIp}"] }`,
-                add_network: `POST /whitelist/network with { "networks": ["${networkInfo.network_range}"] }`
-            }
-        });
-    }
-
-    next();
-};
-
-// Apply authentication to protected routes
 app.use('/testresults', authenticateBranch);
 app.use('/data', authenticateBranch);
 
-// ============= TEST ENDPOINTS =============
 app.get('/testresults', (req, res) => {
     res.json({
         success: true,
         message: 'Protected endpoint - you are authenticated!',
+        your_ip: req.clientIp,
         data: latestData
     });
 });
@@ -625,76 +529,217 @@ app.get('/data', (req, res) => {
     res.json({
         success: true,
         message: 'Protected data endpoint',
+        your_ip: req.clientIp,
         records: latestData.records || []
+    });
+});
+
+app.post('/data/realtimedata', authenticateBranch, async (req, res) => {
+    const { timestamp, records, count, source, table } = req.body;
+    const sourceSecret = req.headers['x-source-secret'];
+    const expectedSecret = process.env.REMOTE_SECRET;
+
+    console.log(`\n📡 STREAM RECEIVED at ${new Date().toISOString()}`);
+    console.log(`   Records: ${count || (records && records.length) || 0}`);
+    console.log(`   Source:  ${source || 'local_pc'}`);
+    console.log(`   Table:   ${table || 'unknown'}`);
+
+    if (expectedSecret && sourceSecret !== expectedSecret) {
+        console.log(`❌ Invalid secret — rejecting data`);
+        return res.status(401).json({ error: 'Invalid secret' });
+    }
+
+    if (!records || records.length === 0) {
+        console.log(`⚠️ No records in stream`);
+        return res.json({ success: true, message: 'No data to process' });
+    }
+
+    latestData = {
+        records: records,
+        lastUpdate: new Date().toISOString(),
+        source: source || 'local_pc',
+        table: table || 'unknown',
+        count: records.length,
+        receivedAt: timestamp
+    };
+
+    dataHistory.unshift({
+        timestamp: new Date().toISOString(),
+        recordCount: records.length,
+        source: source || 'local_pc'
+    });
+
+    if (dataHistory.length > MAX_HISTORY) dataHistory.pop();
+
+    console.log(`✅ Data stored: ${records.length} records`);
+
+    const broadcastPayload = {
+        type: 'live_update',
+        timestamp: new Date().toISOString(),
+        records: records,
+        count: records.length,
+        source: source || 'local_pc',
+        table: table || 'unknown'
+    };
+
+    let branchesNotified = 0;
+    for (const [branchId, branchSocket] of connectedBranches) {
+        branchSocket.emit('data_update', broadcastPayload);
+        branchesNotified++;
+    }
+
+    console.log(`📢 Broadcast to ${branchesNotified} connected branch offices`);
+
+    res.json({
+        success: true,
+        received: records.length,
+        stored: true,
+        branchesNotified: branchesNotified,
+        timestamp: new Date().toISOString()
     });
 });
 
 // ============= ROOT ENDPOINT =============
 app.get('/', (req, res) => {
+    const networkInfo = getClientNetworkInfo(req);
+    
     res.json({
-        name: 'Company Network Authentication Server',
+        name: 'PC Tracking & Authentication Server',
         status: 'online',
-        endpoints: {
-            'GET /my-network-check': 'Check if your PC/network is whitelisted (HIT THIS FROM YOUR PC)',
-            'GET /whitelist': 'View whitelist',
-            'POST /whitelist/static': 'Add static IPs',
-            'POST /whitelist/network': 'Add network ranges',
-            'DELETE /whitelist': 'Remove from whitelist'
+        version: '3.0.0',
+        total_pcs_tracked: pcAccessLog.size,
+        your_network: {
+            client_ip: networkInfo.client_ip,
+            ip_chain: networkInfo.ip_chain,
+            socket_ip: networkInfo.socket.remoteAddress
         },
-        example_usage: {
-            check_network: 'GET /my-network-check',
-            add_your_ip: 'POST /whitelist/static with { "ips": ["YOUR_IP_HERE"] }',
-            add_your_network: 'POST /whitelist/network with { "networks": ["YOUR_NETWORK_HERE"] }'
+        endpoints: {
+            'GET /my-pc-check': 'Show your PC network information',
+            'GET /all-pcs': 'Show ALL PCs that have accessed this server',
+            'GET /pc/:ip': 'Show details for a specific PC',
+            'DELETE /all-pcs': 'Clear PC access log',
+            'GET /whitelist': 'View whitelist',
+            'POST /whitelist/static': 'Add static IPs to whitelist',
+            'POST /whitelist/network': 'Add network ranges to whitelist',
+            'DELETE /whitelist': 'Remove from whitelist'
         },
         timestamp: new Date().toISOString()
     });
 });
 
+// ============= WEBSOCKET =============
+io.on('connection', (socket) => {
+    const branchId = socket.id;
+    const fwd = socket.handshake.headers['x-forwarded-for'];
+    const clientIp = fwd ? fwd.split(',')[0].trim() : (socket.handshake.address || 'Unknown');
+    const clientMac = socket.handshake.headers['x-mac-address'] || 'Not provided';
+
+    console.log(`\n🔐 WEBSOCKET CONNECTION:`);
+    console.log(`   📍 Client IP: ${clientIp}`);
+    console.log(`   🖥️  MAC:       ${clientMac}`);
+    console.log(`   🆔 Socket ID: ${branchId}`);
+
+    connectedBranches.set(branchId, socket);
+
+    if (latestData.records && latestData.records.length > 0) {
+        socket.emit('connected', {
+            status: 'connected',
+            message: 'Connected to data relay server',
+            recordCount: latestData.count,
+            lastUpdate: latestData.lastUpdate,
+            hasData: true
+        });
+        socket.emit('data_update', {
+            type: 'initial',
+            timestamp: new Date().toISOString(),
+            records: latestData.records,
+            count: latestData.count,
+            source: latestData.source
+        });
+        console.log(`📤 Sent initial data (${latestData.count} records) to branch ${branchId}`);
+    } else {
+        socket.emit('connected', {
+            status: 'connected',
+            message: 'Connected to data relay server — waiting for data from local PC',
+            hasData: false
+        });
+    }
+
+    socket.on('filter_request', (filters) => {
+        console.log(`🔍 Branch ${branchId} requested filter:`, filters);
+        if (!latestData.records || latestData.records.length === 0) {
+            socket.emit('filter_response', { records: [], count: 0, message: 'No data available' });
+            return;
+        }
+        const filtered = latestData.records.filter(record =>
+            Object.entries(filters).every(([key, value]) =>
+                String(record[key]).toLowerCase().includes(String(value).toLowerCase())
+            )
+        );
+        socket.emit('filter_response', {
+            records: filtered,
+            count: filtered.length,
+            filters,
+            timestamp: new Date().toISOString()
+        });
+        console.log(`📤 Sent ${filtered.length} filtered records to branch ${branchId}`);
+    });
+
+    socket.on('refresh_request', () => {
+        console.log(`🔄 Branch ${branchId} requested refresh`);
+        if (latestData.records && latestData.records.length > 0) {
+            socket.emit('data_update', {
+                type: 'refresh',
+                timestamp: new Date().toISOString(),
+                records: latestData.records,
+                count: latestData.count,
+                source: latestData.source
+            });
+        }
+    });
+
+    socket.on('ping', () => {
+        socket.emit('pong', { timestamp: new Date().toISOString() });
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`🏢 BRANCH OFFICE DISCONNECTED: ${branchId}`);
+        connectedBranches.delete(branchId);
+    });
+});
+
 // ============= START SERVER =============
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`
     ═══════════════════════════════════════════════════════
-    🏢 COMPANY NETWORK AUTHENTICATION SERVER
+    🖥️  PC TRACKING & AUTHENTICATION SERVER
     ═══════════════════════════════════════════════════════
-    📍 URL:        http://localhost:${PORT}
+    📍 URL:        http://0.0.0.0:${PORT}
     
-    📡 HIT THIS ENDPOINT FROM YOUR PC:
-       GET /my-network-check
-       
-       This will show:
-       ✅ Your local PC IP
-       ✅ Your Router/Gateway ID
-       ✅ Your Network Range
-       ✅ If you're whitelisted or not
+    📡 Track ALL PCs accessing this server:
+       GET /all-pcs  → See every PC that has connected
     
-    💡 Example:
-       curl http://localhost:${PORT}/my-network-check
+    📋 What you'll see for each PC:
+       - IP address
+       - First seen / Last seen
+       - Total requests made
+       - IP chain (proxy path)
+       - User agent
+       - Whitelist status
+       - Request history
     
+    🔐 Authentication: IP from x-forwarded-for Header
+    
+    💡 Test from your PC:
+       curl http://localhost:${PORT}/my-pc-check
+    
+    📊 View all PCs:
+       curl http://localhost:${PORT}/all-pcs
+    
+    🔑 Add your PC to whitelist:
+       curl -X POST /whitelist/static \\
+         -H "Content-Type: application/json" \\
+         -d '{"ips": ["YOUR_IP_HERE"]}'
     ═══════════════════════════════════════════════════════
     `);
 });
-
-console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║                                                          ║
-║  🖥️  FROM YOUR COMPANY PC, RUN:                         ║
-║                                                          ║
-║  curl http://YOUR_SERVER_IP:${PORT}/my-network-check      ║
-║                                                          ║
-║  This will show:                                        ║
-║                                                          ║
-║  {                                                      ║
-║    "your_network": {                                   ║
-║      "local_pc_ip": "192.168.0.12",     ← Your PC IP   ║
-║      "router_id": "192.168.0.1",        ← Router/Gateway║
-║      "network_range": "192.168.0.0/24", ← Your Network  ║
-║      "is_whitelisted": true/false       ← Status       ║
-║    }                                                   ║
-║  }                                                      ║
-║                                                          ║
-║  If NOT whitelisted, add your network:                  ║
-║  POST /whitelist/network                               ║
-║  { "networks": ["192.168.0.0/24"] }                    ║
-║                                                          ║
-╚═══════════════════════════════════════════════════════════╝
-`);
