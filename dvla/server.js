@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
+const os = require('os');
 require('dotenv').config();
 
 const app = express();
@@ -67,6 +68,35 @@ function getClientIp(req) {
     }
 
     return 'Unknown';
+}
+
+// ============= HELPER: Get Server's Public IP =============
+function getServerPublicIp() {
+    try {
+        // Get all network interfaces
+        const interfaces = os.networkInterfaces();
+        const addresses = [];
+        
+        for (const name of Object.keys(interfaces)) {
+            for (const iface of interfaces[name]) {
+                // Skip internal and non-IPv4 addresses
+                if (!iface.internal && iface.family === 'IPv4') {
+                    addresses.push(iface.address);
+                }
+            }
+        }
+        
+        // If we have external addresses, return the first one
+        if (addresses.length > 0) {
+            return addresses[0];
+        }
+        
+        // Fallback to localhost
+        return '127.0.0.1';
+    } catch (error) {
+        console.error('Error getting server IP:', error);
+        return 'Unable to determine server IP';
+    }
 }
 
 // ============= AUTHENTICATION =============
@@ -143,6 +173,64 @@ const authenticateBranch = (req, res, next) => {
 // Apply authentication to protected routes
 app.use('/testresults', authenticateBranch);
 app.use('/data',        authenticateBranch);
+
+// ============= ENDPOINT: Server IP + Access Check =============
+// Hit this to get the server's public IP and check if it's whitelisted
+app.get('/server-ip', (req, res) => {
+    const serverIp = getServerPublicIp();
+    const isWhitelisted = allowedIps.includes(serverIp);
+    
+    console.log(`\n🖥️ SERVER IP REQUEST — IP: ${serverIp} | Whitelisted: ${isWhitelisted}`);
+    
+    // Get additional network info
+    const networkInfo = {
+        interfaces: {},
+        publicIp: serverIp,
+        isWhitelisted: isWhitelisted
+    };
+    
+    // Get all network interfaces for debugging
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        networkInfo.interfaces[name] = interfaces[name].map(iface => ({
+            address: iface.address,
+            family: iface.family,
+            internal: iface.internal
+        }));
+    }
+    
+    if (allowedIps.length === 0) {
+        return res.status(403).json({
+            success: false,
+            server_ip: serverIp,
+            is_whitelisted: false,
+            message: '❌ No IPs have been whitelisted yet. POST to /allowed-ips first.',
+            network_info: networkInfo
+        });
+    }
+    
+    if (isWhitelisted) {
+        return res.json({
+            success: true,
+            server_ip: serverIp,
+            is_whitelisted: true,
+            message: `✅ Server IP (${serverIp}) is whitelisted in ALLOWED_IPS`,
+            network_info: networkInfo,
+            whitelist_count: allowedIps.length,
+            all_whitelisted_ips: allowedIps
+        });
+    } else {
+        return res.status(403).json({
+            success: false,
+            server_ip: serverIp,
+            is_whitelisted: false,
+            message: `❌ Server IP (${serverIp}) is NOT whitelisted. Add it to ALLOWED_IPS via POST /allowed-ips or .env`,
+            network_info: networkInfo,
+            current_whitelist: allowedIps,
+            suggestion: `Run: curl -X POST /allowed-ips -H "Content-Type: application/json" -d '{"ips": ["${serverIp}"]}'`
+        });
+    }
+});
 
 // ============= ENDPOINT: My IP + Access Check =============
 // Hit this from any browser to see your public IP and whether you are allowed.
@@ -311,8 +399,9 @@ app.get('/', (req, res) => {
             mac_whitelist: process.env.ALLOWED_MACS ? 'ENABLED'  : 'DISABLED (set ALLOWED_MACS in .env)'
         },
         discovery_endpoints: {
-            my_public_ip: 'GET /my-ip   — open in browser to find your public IP',
-            my_mac:       'GET /my-mac  — send x-mac-address header to verify your MAC'
+            server_ip:      'GET /server-ip   — get server IP and check if whitelisted',
+            my_public_ip:   'GET /my-ip   — open in browser to find your public IP',
+            my_mac:         'GET /my-mac  — send x-mac-address header to verify your MAC'
         },
         protected_endpoints: {
             receive_stream: 'POST /data/realtimedata',
@@ -634,15 +723,18 @@ io.on('connection', (socket) => {
 
 // ============= START SERVER =============
 server.listen(PORT, () => {
+    const serverIp = getServerPublicIp();
     console.log(`
     ═══════════════════════════════════════════════════════
     🌐 REMOTE RELAY SERVER
     ═══════════════════════════════════════════════════════
     📍 URL:        ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
+    🖥️ Server IP:  ${serverIp}
     🔐 IP auth:    ${process.env.ALLOWED_IPS  ? 'ENABLED  → ' + process.env.ALLOWED_IPS  : 'DISABLED (set ALLOWED_IPS in .env)'}
     🔐 MAC auth:   ${process.env.ALLOWED_MACS ? 'ENABLED  → ' + process.env.ALLOWED_MACS : 'DISABLED (set ALLOWED_MACS in .env)'}
-    📡 GET /my-ip  → see your public IP (use this in ALLOWED_IPS)
-    📡 GET /my-mac → verify your MAC  (use this in ALLOWED_MACS)
+    📡 GET /server-ip → check if server IP is whitelisted
+    📡 GET /my-ip     → see your public IP (use this in ALLOWED_IPS)
+    📡 GET /my-mac    → verify your MAC  (use this in ALLOWED_MACS)
     ═══════════════════════════════════════════════════════
     `);
 });
