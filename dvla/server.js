@@ -32,14 +32,37 @@ let connectedBranches = new Map();
 let dataHistory = [];
 const MAX_HISTORY = 50;
 
-// In-memory allowed IPs list — seeded from .env, updated via POST /allowed-ips
-let allowedIps = process.env.ALLOWED_IPS
-    ? process.env.ALLOWED_IPS.split(',').map(ip => ip.trim()).filter(Boolean)
+// ============= WHITELIST CONFIGURATION =============
+// Support BOTH network ranges AND static IPs
+// This is perfect for company networks with static configs
+
+// 1. Network ranges (CIDR) - for dynamic IPs within a company network
+let whitelistedNetworks = process.env.WHITELISTED_NETWORKS
+    ? process.env.WHITELISTED_NETWORKS.split(',').map(network => network.trim()).filter(Boolean)
     : [];
 
-// Separate list for server IPs that are whitelisted for internal use
-let whitelistedServerIps = process.env.WHITELISTED_SERVER_IPS
-    ? process.env.WHITELISTED_SERVER_IPS.split(',').map(ip => ip.trim()).filter(Boolean)
+// 2. Static IPs - for company servers with fixed IPs
+let whitelistedStaticIps = process.env.WHITELISTED_STATIC_IPS
+    ? process.env.WHITELISTED_STATIC_IPS.split(',').map(ip => ip.trim()).filter(Boolean)
+    : [];
+
+// 3. IP ranges (start-end) - for company subnets
+let whitelistedIpRanges = [];
+
+// Parse IP ranges from env if provided
+if (process.env.WHITELISTED_IP_RANGES) {
+    const ranges = process.env.WHITELISTED_IP_RANGES.split(',').map(range => range.trim()).filter(Boolean);
+    for (const range of ranges) {
+        const [start, end] = range.split('-');
+        if (start && end) {
+            whitelistedIpRanges.push({ start: start.trim(), end: end.trim() });
+        }
+    }
+}
+
+// 4. Company network with specific subnet mask (e.g., /16 for larger companies)
+let whitelistedSubnets = process.env.WHITELISTED_SUBNETS
+    ? process.env.WHITELISTED_SUBNETS.split(',').map(subnet => subnet.trim()).filter(Boolean)
     : [];
 
 // ============= LOGGING =============
@@ -48,16 +71,14 @@ app.use((req, res, next) => {
     next();
 });
 
-// ============= HELPER: Get Real Client Public IP =============
-// Checks headers in priority order. Works on Render, Railway,
-// Heroku, Fly.io, Cloudflare, Nginx, bare Node — every platform.
+// ============= HELPER: Get Client IP =============
 function getClientIp(req) {
     const candidates = [
-        req.headers['cf-connecting-ip'],    // Cloudflare
-        req.headers['x-forwarded-for'],     // Most proxies / load balancers
-        req.headers['x-real-ip'],           // Nginx
-        req.headers['true-client-ip'],      // Akamai / Cloudflare Enterprise
-        req.headers['x-client-ip'],         // Some CDNs
+        req.headers['cf-connecting-ip'],
+        req.headers['x-forwarded-for'],
+        req.headers['x-real-ip'],
+        req.headers['true-client-ip'],
+        req.headers['x-client-ip'],
         req.socket && req.socket.remoteAddress,
         req.connection && req.connection.remoteAddress
     ];
@@ -75,121 +96,269 @@ function getClientIp(req) {
     return 'Unknown';
 }
 
-// ============= HELPER: Get Local Network IPs =============
-function getLocalNetworkIps() {
-    try {
-        const interfaces = os.networkInterfaces();
-        const localIps = [];
-        const allIps = [];
-        
-        for (const name of Object.keys(interfaces)) {
-            for (const iface of interfaces[name]) {
-                // Skip internal (localhost) and non-IPv4
-                if (!iface.internal && iface.family === 'IPv4') {
-                    localIps.push({
-                        interface: name,
-                        address: iface.address,
-                        netmask: iface.netmask,
-                        mac: iface.mac
-                    });
-                }
-                
-                // Collect all IPv4 addresses for debugging
-                if (iface.family === 'IPv4') {
-                    allIps.push({
-                        interface: name,
-                        address: iface.address,
-                        internal: iface.internal,
-                        netmask: iface.netmask
-                    });
-                }
+// ============= HELPER: IP to Number =============
+function ipToNumber(ip) {
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(isNaN)) return null;
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+}
+
+// ============= HELPER: Check if IP is in network range (CIDR) =============
+function isIpInCidrRange(ip, cidr) {
+    if (!ip || !cidr) return false;
+    
+    const [network, maskBits] = cidr.split('/');
+    if (!network || !maskBits) return false;
+    
+    const ipNum = ipToNumber(ip);
+    const networkNum = ipToNumber(network);
+    if (ipNum === null || networkNum === null) return false;
+    
+    const mask = parseInt(maskBits);
+    const cidrMask = ~0 << (32 - mask);
+    
+    return (ipNum & cidrMask) === (networkNum & cidrMask);
+}
+
+// ============= HELPER: Check if IP is in IP range =============
+function isIpInRange(ip, startIp, endIp) {
+    if (!ip || !startIp || !endIp) return false;
+    
+    const ipNum = ipToNumber(ip);
+    const startNum = ipToNumber(startIp);
+    const endNum = ipToNumber(endIp);
+    
+    if (ipNum === null || startNum === null || endNum === null) return false;
+    
+    return ipNum >= startNum && ipNum <= endNum;
+}
+
+// ============= HELPER: Check if IP is in whitelisted subnet =============
+function isIpInWhitelistedSubnet(ip, subnet) {
+    if (!ip || !subnet) return false;
+    
+    // Support both CIDR and full subnet masks
+    if (subnet.includes('/')) {
+        return isIpInCidrRange(ip, subnet);
+    }
+    
+    // Check if IP starts with subnet prefix
+    const subnetParts = subnet.split('.');
+    const ipParts = ip.split('.');
+    
+    if (subnetParts.length !== ipParts.length) return false;
+    
+    for (let i = 0; i < subnetParts.length; i++) {
+        if (subnetParts[i] !== '*' && subnetParts[i] !== ipParts[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============= HELPER: Main IP Validation =============
+function isIpWhitelisted(ip) {
+    if (!ip) return false;
+    
+    // Check 1: Static IP whitelist
+    if (whitelistedStaticIps.includes(ip)) {
+        console.log(`   ✅ Static IP match: ${ip}`);
+        return true;
+    }
+    
+    // Check 2: Network ranges (CIDR)
+    for (const network of whitelistedNetworks) {
+        if (isIpInCidrRange(ip, network)) {
+            console.log(`   ✅ Network range match: ${network}`);
+            return true;
+        }
+    }
+    
+    // Check 3: IP ranges
+    for (const range of whitelistedIpRanges) {
+        if (isIpInRange(ip, range.start, range.end)) {
+            console.log(`   ✅ IP range match: ${range.start} - ${range.end}`);
+            return true;
+        }
+    }
+    
+    // Check 4: Subnet prefixes (for company networks with consistent prefixes)
+    for (const subnet of whitelistedSubnets) {
+        if (isIpInWhitelistedSubnet(ip, subnet)) {
+            console.log(`   ✅ Subnet match: ${subnet}`);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// ============= HELPER: Get Network Info =============
+function getNetworkInfo(ip) {
+    const info = {
+        ip: ip,
+        is_static: whitelistedStaticIps.includes(ip),
+        matching_network: null,
+        matching_range: null,
+        matching_subnet: null,
+        is_whitelisted: false,
+        network_type: 'unknown'
+    };
+    
+    // Check CIDR networks
+    for (const network of whitelistedNetworks) {
+        if (isIpInCidrRange(ip, network)) {
+            info.matching_network = network;
+            info.is_whitelisted = true;
+            break;
+        }
+    }
+    
+    // Check IP ranges
+    if (!info.is_whitelisted) {
+        for (const range of whitelistedIpRanges) {
+            if (isIpInRange(ip, range.start, range.end)) {
+                info.matching_range = range;
+                info.is_whitelisted = true;
+                break;
             }
         }
-        
-        return {
-            local_ips: localIps,
-            all_ips: allIps,
-            primary_ip: localIps.length > 0 ? localIps[0].address : '127.0.0.1'
-        };
-    } catch (error) {
-        console.error('Error getting local network IPs:', error);
-        return {
-            local_ips: [],
-            all_ips: [],
-            primary_ip: 'Unable to determine'
-        };
     }
+    
+    // Check subnets
+    if (!info.is_whitelisted) {
+        for (const subnet of whitelistedSubnets) {
+            if (isIpInWhitelistedSubnet(ip, subnet)) {
+                info.matching_subnet = subnet;
+                info.is_whitelisted = true;
+                break;
+            }
+        }
+    }
+    
+    // Determine network type
+    if (isIpInPrivateRange(ip)) {
+        info.network_type = 'private';
+    } else {
+        info.network_type = 'public';
+    }
+    
+    // If static IP is whitelisted, mark as whitelisted
+    if (whitelistedStaticIps.includes(ip)) {
+        info.is_whitelisted = true;
+        info.is_static = true;
+    }
+    
+    return info;
+}
+
+// ============= HELPER: Check if IP is in private range =============
+function isIpInPrivateRange(ip) {
+    if (!ip || ip === 'Unknown') return false;
+    
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4) return false;
+    if (parts.some(isNaN)) return false;
+    
+    // 10.0.0.0/8
+    if (parts[0] === 10) return true;
+    
+    // 172.16.0.0/12
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    
+    // 192.168.0.0/16
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    
+    // 127.0.0.0/8
+    if (parts[0] === 127) return true;
+    
+    return false;
 }
 
 // ============= AUTHENTICATION =============
-// Reads ALLOWED_IPS and ALLOWED_MACS from .env
-//
-// .env example:
-//   ALLOWED_IPS=41.58.120.5,41.58.120.6
-//   ALLOWED_MACS=AA:BB:CC:DD:EE:FF,11:22:33:44:55:66
-//   WHITELISTED_SERVER_IPS=192.168.1.100,192.168.1.101
-//
-// Rules:
-//   - If ALLOWED_IPS is set   → request's public IP must be in the list
-//   - If ALLOWED_MACS is set  → x-mac-address header must be in the list
-//   - If BOTH are set         → BOTH must pass (strictest)
-//   - If NEITHER is set       → open access (dev mode)
-
+// Supports both static IPs and network ranges for company networks
 const authenticateBranch = (req, res, next) => {
-    const clientIp  = getClientIp(req);
-    const clientMac = (req.headers['x-mac-address'] || '').toUpperCase();
+    const clientIp = getClientIp(req);
+    const networkInfo = getNetworkInfo(clientIp);
+    
+    console.log(`\n🔐 AUTH CHECK (Company Network Ready):`);
+    console.log(`   📍 Client IP:          ${clientIp}`);
+    console.log(`   🔒 Is Private:         ${isIpInPrivateRange(clientIp)}`);
+    console.log(`   📊 Network Type:       ${networkInfo.network_type}`);
+    console.log(`   ✅ Is Whitelisted:     ${networkInfo.is_whitelisted}`);
+    console.log(`   📋 Matching Config:    ${networkInfo.matching_network || networkInfo.matching_range || networkInfo.matching_subnet || 'None'}`);
+    console.log(`   🔢 Static IP Match:    ${networkInfo.is_static}`);
 
-    const allowedMacs = process.env.ALLOWED_MACS
-        ? process.env.ALLOWED_MACS.split(',').map(m => m.trim().toUpperCase())
-        : [];
+    // Check if we have ANY whitelist configured
+    const hasWhitelist = whitelistedStaticIps.length > 0 || 
+                        whitelistedNetworks.length > 0 || 
+                        whitelistedIpRanges.length > 0 || 
+                        whitelistedSubnets.length > 0;
 
-    console.log(`\n🔐 AUTH CHECK:`);
-    console.log(`   📍 Client Public IP : ${clientIp}`);
-    console.log(`   🖥️  Client MAC       : ${clientMac || 'Not provided'}`);
-    console.log(`   ✅ Allowed IPs       : ${allowedIps.length  ? allowedIps.join(', ')  : 'Any (not set)'}`);
-    console.log(`   ✅ Allowed MACs      : ${allowedMacs.length ? allowedMacs.join(', ') : 'Any (not set)'}`);
+    if (!hasWhitelist) {
+        console.log(`   ⚠️ No whitelist configured - allowing access (development mode)`);
+        return next();
+    }
 
-    // --- IP check ---
-    if (allowedIps.length === 0) {
-        console.log(`   ❌ No IPs whitelisted yet — access denied`);
+    if (!networkInfo.is_whitelisted) {
+        console.log(`   ❌ ACCESS DENIED - IP not in any whitelist`);
+        
+        // Determine what to suggest
+        let suggestion = '';
+        let exampleConfig = '';
+        
+        if (isIpInPrivateRange(clientIp)) {
+            // For private IPs, suggest network ranges
+            const ipParts = clientIp.split('.');
+            suggestion = `Your IP is ${clientIp} in a private range.`;
+            
+            if (ipParts[0] === '192' && ipParts[1] === '168') {
+                suggestion += ` Add your network: ${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.0/24`;
+                exampleConfig = `WHITELISTED_NETWORKS=${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.0/24`;
+            } else if (ipParts[0] === '10') {
+                suggestion += ` Add your network: 10.0.0.0/8`;
+                exampleConfig = `WHITELISTED_NETWORKS=10.0.0.0/8`;
+            } else if (ipParts[0] === '172' && ipParts[1] >= 16 && ipParts[1] <= 31) {
+                suggestion += ` Add your network: 172.16.0.0/12`;
+                exampleConfig = `WHITELISTED_NETWORKS=172.16.0.0/12`;
+            }
+        } else {
+            // For public IPs, suggest static IP whitelist
+            suggestion = `Your IP (${clientIp}) is public. Add it as a static IP.`;
+            exampleConfig = `WHITELISTED_STATIC_IPS=${clientIp}`;
+        }
+        
         return res.status(403).json({
             success: false,
-            error:   'Access denied',
-            reason:  'No IPs have been whitelisted yet. POST to /allowed-ips first.'
+            error: 'Access denied',
+            reason: 'Your IP/network is not authorized to access this server.',
+            your_ip: clientIp,
+            network_info: {
+                is_private: isIpInPrivateRange(clientIp),
+                network_type: networkInfo.network_type
+            },
+            current_whitelist: {
+                static_ips: whitelistedStaticIps,
+                networks: whitelistedNetworks,
+                ip_ranges: whitelistedIpRanges,
+                subnets: whitelistedSubnets
+            },
+            suggestion: suggestion,
+            how_to_fix: {
+                method_1: `Add to .env: ${exampleConfig}`,
+                method_2: `POST to /whitelist with your network/ip`,
+                method_3: `For static IPs: WHITELISTED_STATIC_IPS=${clientIp}`,
+                method_4: `For company network: WHITELISTED_NETWORKS=192.168.0.0/16`
+            },
+            company_network_help: {
+                static_ip: 'If IP is static, add to WHITELISTED_STATIC_IPS',
+                network_range: 'If IP is dynamic within company, add to WHITELISTED_NETWORKS',
+                subnet: 'If company uses specific subnet, add to WHITELISTED_SUBNETS'
+            }
         });
     }
 
-    if (!allowedIps.includes(clientIp)) {
-        console.log(`   ❌ IP NOT ALLOWED: ${clientIp}`);
-        return res.status(403).json({
-            success: false,
-            error:   'Access denied',
-            reason:  `Your public IP (${clientIp}) is not on the allowed list.`,
-            hint:    'Ask the admin to add your IP via POST /allowed-ips'
-        });
-    }
-
-    // --- MAC check ---
-    if (allowedMacs.length > 0) {
-        if (!clientMac) {
-            console.log(`   ❌ MAC required but not provided`);
-            return res.status(401).json({
-                success: false,
-                error:   'MAC address required',
-                reason:  'Send your MAC in the x-mac-address request header.'
-            });
-        }
-        if (!allowedMacs.includes(clientMac)) {
-            console.log(`   ❌ MAC NOT ALLOWED: ${clientMac}`);
-            return res.status(403).json({
-                success: false,
-                error:   'Access denied',
-                reason:  `Your MAC address (${clientMac}) is not on the allowed list.`
-            });
-        }
-    }
-
-    console.log(`   ✅ ACCESS GRANTED`);
+    console.log(`   ✅ ACCESS GRANTED — ${networkInfo.is_static ? 'Static IP' : 'Network range'} match`);
     next();
 };
 
@@ -197,142 +366,62 @@ const authenticateBranch = (req, res, next) => {
 app.use('/testresults', authenticateBranch);
 app.use('/data',        authenticateBranch);
 
-// ============= ENDPOINT: Server Local Network IP + Access Check =============
-// Hit this to get the server's local network IP and check if it's whitelisted
-app.get('/server-ip', (req, res) => {
-    const networkInfo = getLocalNetworkIps();
-    const primaryIp = networkInfo.primary_ip;
-    const isWhitelisted = whitelistedServerIps.includes(primaryIp);
-    
-    console.log(`\n🖥️ SERVER LOCAL IP REQUEST — Primary IP: ${primaryIp} | Whitelisted: ${isWhitelisted}`);
-    
-    // Check all local IPs against whitelist
-    const ipStatus = networkInfo.local_ips.map(ip => ({
-        interface: ip.interface,
-        address: ip.address,
-        netmask: ip.netmask,
-        mac: ip.mac,
-        is_whitelisted: whitelistedServerIps.includes(ip.address)
-    }));
-    
-    if (whitelistedServerIps.length === 0) {
-        return res.status(403).json({
-            success: false,
-            server_local_ips: networkInfo.local_ips.map(ip => ip.address),
-            primary_ip: primaryIp,
-            is_whitelisted: false,
-            message: '❌ No server IPs have been whitelisted yet. POST to /white/s/p first.',
-            network_info: networkInfo,
-            suggestion: `Run: curl -X POST /white/s/p -H "Content-Type: application/json" -d '{"ips": ["${primaryIp}"]}'`
-        });
-    }
-    
-    if (isWhitelisted) {
-        return res.json({
-            success: true,
-            server_local_ips: networkInfo.local_ips.map(ip => ip.address),
-            primary_ip: primaryIp,
-            is_whitelisted: true,
-            message: `✅ Server local IP (${primaryIp}) is whitelisted in WHITELISTED_SERVER_IPS`,
-            network_info: {
-                all_interfaces: networkInfo.all_ips,
-                local_interfaces: networkInfo.local_ips
-            },
-            server_whitelist: whitelistedServerIps,
-            whitelist_count: whitelistedServerIps.length
-        });
-    } else {
-        return res.status(403).json({
-            success: false,
-            server_local_ips: networkInfo.local_ips.map(ip => ip.address),
-            primary_ip: primaryIp,
-            is_whitelisted: false,
-            message: `❌ Server local IP (${primaryIp}) is NOT whitelisted. Add it via POST /white/s/p`,
-            network_info: {
-                all_interfaces: networkInfo.all_ips,
-                local_interfaces: networkInfo.local_ips
-            },
-            current_server_whitelist: whitelistedServerIps,
-            suggestion: `Run: curl -X POST /white/s/p -H "Content-Type: application/json" -d '{"ips": ["${primaryIp}"]}'`
-        });
-    }
-});
+// ============= ENDPOINT: Whitelist Management =============
+// Supports adding static IPs, network ranges, and IP ranges
 
-// ============= ENDPOINT: Whitelist Server Local IPs =============
-// POST /white/s/p - Add server local IPs to the whitelist
-// Body: { "ips": ["192.168.1.100", "192.168.1.101"] }
-// or:   { "ips": "192.168.1.100" } (single string also accepted)
-// GET  /white/s/p - View all whitelisted server IPs
-// DELETE /white/s/p - Remove a server IP from the whitelist
-
-// GET - View whitelisted server IPs
-app.get('/white/s/p', (req, res) => {
-    const networkInfo = getLocalNetworkIps();
-    const primaryIp = networkInfo.primary_ip;
-    
-    // Check which local IPs are whitelisted
-    const ipStatus = networkInfo.local_ips.map(ip => ({
-        interface: ip.interface,
-        address: ip.address,
-        is_whitelisted: whitelistedServerIps.includes(ip.address)
-    }));
-    
+// GET - View all whitelists
+app.get('/whitelist', (req, res) => {
     res.json({
         success: true,
-        count: whitelistedServerIps.length,
-        whitelisted_server_ips: whitelistedServerIps,
-        current_server: {
-            primary_ip: primaryIp,
-            all_local_ips: networkInfo.local_ips.map(ip => ip.address),
-            is_primary_whitelisted: whitelistedServerIps.includes(primaryIp),
-            ip_status: ipStatus
+        whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks,
+            ip_ranges: whitelistedIpRanges,
+            subnets: whitelistedSubnets
         },
-        note: whitelistedServerIps.length === 0
-            ? 'No server IPs have been whitelisted yet'
-            : 'These server local IPs are allowed for internal operations',
+        counts: {
+            static_ips: whitelistedStaticIps.length,
+            networks: whitelistedNetworks.length,
+            ip_ranges: whitelistedIpRanges.length,
+            subnets: whitelistedSubnets.length,
+            total: whitelistedStaticIps.length + 
+                   whitelistedNetworks.length + 
+                   whitelistedIpRanges.length + 
+                   whitelistedSubnets.length
+        },
         usage: {
-            add: 'POST /white/s/p with { "ips": ["192.168.1.100", "192.168.1.101"] }',
-            remove: 'DELETE /white/s/p with { "ip": "192.168.1.100" }',
-            view: 'GET /white/s/p'
+            add_static_ip: 'POST /whitelist/static with { "ips": ["192.168.1.100"] }',
+            add_network: 'POST /whitelist/network with { "networks": ["192.168.1.0/24"] }',
+            add_range: 'POST /whitelist/range with { "ranges": ["192.168.1.1-192.168.1.254"] }',
+            add_subnet: 'POST /whitelist/subnet with { "subnets": ["192.168.1"] }'
         }
     });
 });
 
-// POST - Add server local IPs to whitelist
-app.post('/white/s/p', (req, res) => {
+// POST - Add static IPs
+app.post('/whitelist/static', (req, res) => {
     const { ips } = req.body;
     const clientIp = getClientIp(req);
-    const networkInfo = getLocalNetworkIps();
 
-    console.log(`\n📋 WHITELIST SERVER IPs REQUEST from ${clientIp}`);
-    console.log(`   Request body:`, req.body);
+    console.log(`\n📋 ADD STATIC IPs from ${clientIp}`);
+    console.log(`   IPs to add: ${ips}`);
 
     if (!ips) {
         return res.status(400).json({
             success: false,
             error: 'Missing field: ips',
-            example: { ips: ['192.168.1.100', '192.168.1.101'] },
-            note: 'You can also provide a single IP as a string: { "ips": "192.168.1.100" }'
+            example: { ips: ['192.168.1.100', '10.0.0.5'] }
         });
     }
 
-    // Accept either a single string or an array
     const incoming = (Array.isArray(ips) ? ips : [ips])
         .map(ip => ip.trim())
         .filter(Boolean);
 
-    if (incoming.length === 0) {
-        return res.status(400).json({
-            success: false,
-            error: 'No valid IPs provided'
-        });
-    }
-
-    // Validate IP format (basic validation)
+    // Validate IPs
     const invalidIps = [];
     const validIps = [];
     for (const ip of incoming) {
-        // Simple IPv4 validation
         const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
         if (ipv4Regex.test(ip) && ip.split('.').every(num => parseInt(num) >= 0 && parseInt(num) <= 255)) {
             validIps.push(ip);
@@ -341,624 +430,422 @@ app.post('/white/s/p', (req, res) => {
         }
     }
 
-    if (validIps.length === 0) {
-        return res.status(400).json({
-            success: false,
-            error: 'No valid IPv4 addresses provided',
-            invalid_ips: invalidIps,
-            hint: 'Please provide valid IPv4 addresses (e.g., 192.168.1.100)'
-        });
-    }
-
-    // Add only new ones (no duplicates)
     const added = [];
     const alreadyExist = [];
     for (const ip of validIps) {
-        if (!whitelistedServerIps.includes(ip)) {
-            whitelistedServerIps.push(ip);
+        if (!whitelistedStaticIps.includes(ip)) {
+            whitelistedStaticIps.push(ip);
             added.push(ip);
         } else {
             alreadyExist.push(ip);
         }
     }
 
-    console.log(`\n📋 WHITELISTED SERVER IPs UPDATED — added: ${added.join(', ') || 'none'}`);
-    console.log(`   Already existed: ${alreadyExist.join(', ') || 'none'}`);
-    console.log(`   Invalid: ${invalidIps.join(', ') || 'none'}`);
-    console.log(`   Full server whitelist: ${whitelistedServerIps.join(', ')}`);
-
-    // Also check if the current server IP is now whitelisted
-    const primaryIp = networkInfo.primary_ip;
-    const isCurrentWhitelisted = whitelistedServerIps.includes(primaryIp);
-
     res.json({
         success: true,
-        message: `Successfully added ${added.length} server IP(s) to the whitelist`,
+        message: `Added ${added.length} static IP(s)`,
         added: added,
         already_existed: alreadyExist,
         invalid: invalidIps,
-        total_server_ips: whitelistedServerIps.length,
-        whitelisted_server_ips: whitelistedServerIps,
-        current_server: {
-            primary_ip: primaryIp,
-            all_local_ips: networkInfo.local_ips.map(ip => ip.address),
-            is_whitelisted: isCurrentWhitelisted
-        },
-        timestamp: new Date().toISOString()
+        static_ips: whitelistedStaticIps,
+        note: 'Static IPs are ideal for company servers with fixed IP addresses'
     });
 });
 
-// DELETE - Remove a server IP from whitelist
-app.delete('/white/s/p', (req, res) => {
-    const { ip } = req.body;
+// POST - Add network ranges (CIDR)
+app.post('/whitelist/network', (req, res) => {
+    const { networks } = req.body;
     const clientIp = getClientIp(req);
 
-    console.log(`\n🗑️ REMOVE SERVER IP from whitelist — Request from ${clientIp}`);
-    console.log(`   IP to remove: ${ip}`);
+    console.log(`\n📋 ADD NETWORK RANGES from ${clientIp}`);
+    console.log(`   Networks to add: ${networks}`);
 
-    if (!ip) {
+    if (!networks) {
         return res.status(400).json({
             success: false,
-            error: 'Missing field: ip',
-            example: { ip: '192.168.1.100' }
+            error: 'Missing field: networks',
+            example: { networks: ['192.168.1.0/24', '10.0.0.0/8'] }
         });
     }
 
-    const trimmedIp = ip.trim();
-    const index = whitelistedServerIps.indexOf(trimmedIp);
-    
-    if (index === -1) {
-        return res.status(404).json({
-            success: false,
-            error: `IP ${trimmedIp} not found in server whitelist`,
-            current_server_ips: whitelistedServerIps
-        });
-    }
-
-    whitelistedServerIps.splice(index, 1);
-    
-    console.log(`   ✅ Removed ${trimmedIp} from server whitelist`);
-    console.log(`   Updated list: ${whitelistedServerIps.join(', ') || '(empty)'}`);
-
-    const networkInfo = getLocalNetworkIps();
-
-    res.json({
-        success: true,
-        message: `Successfully removed ${trimmedIp} from server whitelist`,
-        removed: trimmedIp,
-        remaining_server_ips: whitelistedServerIps,
-        count: whitelistedServerIps.length,
-        current_server: {
-            primary_ip: networkInfo.primary_ip,
-            all_local_ips: networkInfo.local_ips.map(ip => ip.address)
-        },
-        timestamp: new Date().toISOString()
-    });
-});
-
-// ============= ENDPOINT: Get Server Network Info =============
-// Useful for debugging - shows all network interfaces
-app.get('/server-network', (req, res) => {
-    const networkInfo = getLocalNetworkIps();
-    res.json({
-        success: true,
-        network_info: networkInfo,
-        whitelisted_server_ips: whitelistedServerIps,
-        timestamp: new Date().toISOString()
-    });
-});
-
-// ============= ENDPOINT: My IP + Access Check =============
-// Hit this from any browser to see your public IP and whether you are allowed.
-app.get('/my-ip', (req, res) => {
-    const ip      = getClientIp(req);
-    const allowed = allowedIps.includes(ip);
-
-    console.log(`\n🌐 IP REQUEST — resolved: ${ip} | allowed: ${allowed}`);
-
-    if (allowedIps.length === 0) {
-        return res.status(403).json({
-            success:        false,
-            your_public_ip: ip,
-            access:         'DENIED',
-            message:        `❌ No IPs have been whitelisted yet. POST to /allowed-ips first.`
-        });
-    }
-
-    if (allowed) {
-        return res.json({
-            success:        true,
-            your_public_ip: ip,
-            access:         'ALLOWED',
-            message:        `✅ Your IP (${ip}) is authorised to access this server.`
-        });
-    } else {
-        return res.status(403).json({
-            success:        false,
-            your_public_ip: ip,
-            access:         'DENIED',
-            message:        `❌ Your IP (${ip}) is not on the allowed list. Contact the admin.`
-        });
-    }
-});
-
-// ============= ENDPOINT: Allowed IPs =============
-// GET  /allowed-ips         — view the current whitelist
-// POST /allowed-ips         — add one or more IPs to the whitelist
-//   body: { "ips": ["41.58.120.5", "102.89.47.3"] }
-//   or:   { "ips": "41.58.120.5" }   (single string also accepted)
-
-app.get('/allowed-ips', (req, res) => {
-    res.json({
-        success:     true,
-        count:       allowedIps.length,
-        allowed_ips: allowedIps,
-        note:        allowedIps.length === 0
-            ? 'List is empty — all IPs are currently allowed (open access)'
-            : 'Only these public IPs can access protected endpoints'
-    });
-});
-
-app.post('/allowed-ips', (req, res) => {
-    const { ips } = req.body;
-
-    if (!ips) {
-        return res.status(400).json({
-            success: false,
-            error:   'Missing field: ips',
-            example: { ips: ['41.58.120.5', '102.89.47.3'] }
-        });
-    }
-
-    // Accept either a single string or an array
-    const incoming = (Array.isArray(ips) ? ips : [ips])
-        .map(ip => ip.trim())
+    const incoming = (Array.isArray(networks) ? networks : [networks])
+        .map(network => network.trim())
         .filter(Boolean);
 
-    if (incoming.length === 0) {
-        return res.status(400).json({ success: false, error: 'No valid IPs provided' });
-    }
-
-    // Add only new ones (no duplicates)
-    const added = [];
-    for (const ip of incoming) {
-        if (!allowedIps.includes(ip)) {
-            allowedIps.push(ip);
-            added.push(ip);
+    const invalidNetworks = [];
+    const validNetworks = [];
+    for (const network of incoming) {
+        const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
+        if (cidrRegex.test(network)) {
+            const parts = network.split('/');
+            const ipParts = parts[0].split('.');
+            const mask = parseInt(parts[1]);
+            if (ipParts.every(num => parseInt(num) >= 0 && parseInt(num) <= 255) && mask >= 0 && mask <= 32) {
+                validNetworks.push(network);
+            } else {
+                invalidNetworks.push(network);
+            }
+        } else {
+            invalidNetworks.push(network);
         }
     }
 
-    console.log(`\n📋 ALLOWED IPs UPDATED — added: ${added.join(', ') || 'none (already existed)'}`);
-    console.log(`   Full list: ${allowedIps.join(', ')}`);
+    const added = [];
+    const alreadyExist = [];
+    for (const network of validNetworks) {
+        if (!whitelistedNetworks.includes(network)) {
+            whitelistedNetworks.push(network);
+            added.push(network);
+        } else {
+            alreadyExist.push(network);
+        }
+    }
 
     res.json({
-        success:      true,
-        added:        added,
-        skipped:      incoming.filter(ip => !added.includes(ip)),
-        allowed_ips:  allowedIps,
-        count:        allowedIps.length
+        success: true,
+        message: `Added ${added.length} network range(s)`,
+        added: added,
+        already_existed: alreadyExist,
+        invalid: invalidNetworks,
+        networks: whitelistedNetworks,
+        note: 'Network ranges are ideal for company networks with dynamic IPs'
     });
 });
 
-// DELETE /allowed-ips  — remove an IP from the whitelist
-// body: { "ip": "41.58.120.5" }
-app.delete('/allowed-ips', (req, res) => {
-    const { ip } = req.body;
+// POST - Add IP ranges
+app.post('/whitelist/range', (req, res) => {
+    const { ranges } = req.body;
+    const clientIp = getClientIp(req);
 
-    if (!ip) {
-        return res.status(400).json({ success: false, error: 'Missing field: ip' });
-    }
+    console.log(`\n📋 ADD IP RANGES from ${clientIp}`);
+    console.log(`   Ranges to add: ${ranges}`);
 
-    const before = allowedIps.length;
-    allowedIps   = allowedIps.filter(a => a !== ip.trim());
-
-    if (allowedIps.length === before) {
-        return res.status(404).json({ success: false, error: `IP ${ip} not found in list` });
-    }
-
-    console.log(`\n🗑️  ALLOWED IP REMOVED: ${ip}`);
-    res.json({
-        success:     true,
-        removed:     ip,
-        allowed_ips: allowedIps,
-        count:       allowedIps.length
-    });
-});
-
-// ============= ENDPOINT: My MAC =============
-// Server cannot auto-detect MAC. Client must send it in x-mac-address header.
-// Use this endpoint to confirm the server received it correctly.
-app.get('/my-mac', (req, res) => {
-    const mac = req.headers['x-mac-address'];
-    console.log(`\n📱 MAC REQUEST — header: ${mac || 'Not provided'}`);
-
-    if (!mac) {
+    if (!ranges) {
         return res.status(400).json({
             success: false,
-            mac:     null,
-            message: 'No MAC received. Send your MAC in the x-mac-address header.',
-            howToFindYourMac: {
-                windows: 'Run: getmac /v   or   ipconfig /all',
-                mac_os:  'Run: ifconfig en0 | grep ether',
-                linux:   'Run: ip link show   or   cat /sys/class/net/eth0/address'
+            error: 'Missing field: ranges',
+            example: { ranges: ['192.168.1.1-192.168.1.254'] }
+        });
+    }
+
+    const incoming = (Array.isArray(ranges) ? ranges : [ranges])
+        .map(range => range.trim())
+        .filter(Boolean);
+
+    const validRanges = [];
+    const invalidRanges = [];
+    
+    for (const range of incoming) {
+        const [start, end] = range.split('-');
+        if (start && end) {
+            const startTrim = start.trim();
+            const endTrim = end.trim();
+            
+            // Validate IPs
+            const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+            if (ipv4Regex.test(startTrim) && ipv4Regex.test(endTrim)) {
+                const startNum = ipToNumber(startTrim);
+                const endNum = ipToNumber(endTrim);
+                if (startNum !== null && endNum !== null && startNum <= endNum) {
+                    validRanges.push({ start: startTrim, end: endTrim });
+                } else {
+                    invalidRanges.push(range);
+                }
+            } else {
+                invalidRanges.push(range);
             }
-        });
+        } else {
+            invalidRanges.push(range);
+        }
+    }
+
+    const added = [];
+    const alreadyExist = [];
+    for (const range of validRanges) {
+        const exists = whitelistedIpRanges.some(r => r.start === range.start && r.end === range.end);
+        if (!exists) {
+            whitelistedIpRanges.push(range);
+            added.push(`${range.start}-${range.end}`);
+        } else {
+            alreadyExist.push(`${range.start}-${range.end}`);
+        }
     }
 
     res.json({
         success: true,
-        your_mac: mac.toUpperCase(),
-        usage:   'Add this value to ALLOWED_MACS in your server .env to whitelist this device'
+        message: `Added ${added.length} IP range(s)`,
+        added: added,
+        already_existed: alreadyExist,
+        invalid: invalidRanges,
+        ranges: whitelistedIpRanges,
+        note: 'IP ranges are ideal for company subnets with specific IP allocations'
     });
 });
 
-// ============= ROOT ENDPOINT =============
-app.get('/', (req, res) => {
-    const networkInfo = getLocalNetworkIps();
-    res.json({
-        name: 'Remote Data Relay Server',
-        status: 'online',
-        version: '1.0.0',
-        auth_mode: {
-            ip_whitelist:  process.env.ALLOWED_IPS  ? 'ENABLED'  : 'DISABLED (set ALLOWED_IPS in .env)',
-            mac_whitelist: process.env.ALLOWED_MACS ? 'ENABLED'  : 'DISABLED (set ALLOWED_MACS in .env)',
-            server_whitelist: process.env.WHITELISTED_SERVER_IPS ? 'ENABLED' : 'DISABLED (set WHITELISTED_SERVER_IPS in .env)'
-        },
-        server_info: {
-            local_ips: networkInfo.local_ips.map(ip => ip.address),
-            primary_ip: networkInfo.primary_ip
-        },
-        discovery_endpoints: {
-            server_ip:      'GET /server-ip   — get server local IP and check if whitelisted',
-            server_network: 'GET /server-network — view all network interfaces',
-            my_public_ip:   'GET /my-ip   — open in browser to find your public IP',
-            my_mac:         'GET /my-mac  — send x-mac-address header to verify your MAC'
-        },
-        server_ip_management: {
-            view:   'GET /white/s/p     — view all whitelisted server IPs',
-            add:    'POST /white/s/p    — add server IPs to whitelist',
-            remove: 'DELETE /white/s/p  — remove server IP from whitelist'
-        },
-        protected_endpoints: {
-            receive_stream: 'POST /data/realtimedata',
-            get_all_data:   'GET  /testresults',
-            get_paginated:  'GET  /data/page?page=1&pageSize=100',
-            search:         'POST /data/search',
-            find_by_field:  'GET  /data/find/:field/:value',
-            stats:          'GET  /data/stats',
-            history:        'GET  /data/history',
-            health:         'GET  /data/health'
-        },
-        websocket:  'ws://' + req.get('host'),
-        timestamp:  new Date().toISOString()
-    });
-});
+// POST - Add subnets
+app.post('/whitelist/subnet', (req, res) => {
+    const { subnets } = req.body;
+    const clientIp = getClientIp(req);
 
-// ============= HEALTH CHECK =============
-app.get('/data/health', (req, res) => {
-    res.json({
-        status:            'online',
-        hasData:           latestData.records.length > 0,
-        recordCount:       latestData.count,
-        lastUpdate:        latestData.lastUpdate,
-        connectedBranches: connectedBranches.size,
-        historySize:       dataHistory.length,
-        serverWhitelist:   whitelistedServerIps,
-        timestamp:         new Date().toISOString()
-    });
-});
+    console.log(`\n📋 ADD SUBNETS from ${clientIp}`);
+    console.log(`   Subnets to add: ${subnets}`);
 
-// ============= RECEIVE STREAM FROM LOCAL PC =============
-app.post('/data/realtimedata', async (req, res) => {
-    const { timestamp, records, count, source, table } = req.body;
-    const sourceSecret   = req.headers['x-source-secret'];
-    const expectedSecret = process.env.REMOTE_SECRET;
-
-    console.log(`\n📡 STREAM RECEIVED at ${new Date().toISOString()}`);
-    console.log(`   Records: ${count || (records && records.length) || 0}`);
-    console.log(`   Source:  ${source || 'local_pc'}`);
-    console.log(`   Table:   ${table  || 'unknown'}`);
-
-    if (expectedSecret && sourceSecret !== expectedSecret) {
-        console.log(`❌ Invalid secret — rejecting data`);
-        return res.status(401).json({ error: 'Invalid secret' });
-    }
-
-    if (!records || records.length === 0) {
-        console.log(`⚠️ No records in stream`);
-        return res.json({ success: true, message: 'No data to process' });
-    }
-
-    latestData = {
-        records:    records,
-        lastUpdate: new Date().toISOString(),
-        source:     source || 'local_pc',
-        table:      table  || 'unknown',
-        count:      records.length,
-        receivedAt: timestamp
-    };
-
-    dataHistory.unshift({
-        timestamp:   new Date().toISOString(),
-        recordCount: records.length,
-        source:      source || 'local_pc'
-    });
-
-    if (dataHistory.length > MAX_HISTORY) dataHistory.pop();
-
-    console.log(`✅ Data stored: ${records.length} records`);
-
-    const broadcastPayload = {
-        type:      'live_update',
-        timestamp: new Date().toISOString(),
-        records:   records,
-        count:     records.length,
-        source:    source || 'local_pc',
-        table:     table  || 'unknown'
-    };
-
-    let branchesNotified = 0;
-    for (const [branchId, branchSocket] of connectedBranches) {
-        branchSocket.emit('data_update', broadcastPayload);
-        branchesNotified++;
-    }
-
-    console.log(`📢 Broadcast to ${branchesNotified} connected branch offices`);
-
-    res.json({
-        success:          true,
-        received:         records.length,
-        stored:           true,
-        branchesNotified: branchesNotified,
-        timestamp:        new Date().toISOString()
-    });
-});
-
-// ============= BRANCH OFFICE ENDPOINTS =============
-app.get('/testresults', async (req, res) => {
-    console.log(`🏢 Branch requested all data`);
-
-    if (!latestData.records || latestData.records.length === 0) {
-        return res.json({
-            statusCode:    200,
-            statusMessage: 'successful',
-            records:       [],
-            message:       'No data available yet. Waiting for local PC to send data.'
+    if (!subnets) {
+        return res.status(400).json({
+            success: false,
+            error: 'Missing field: subnets',
+            example: { subnets: ['192.168.1', '10.0'] }
         });
     }
 
-    res.json({
-        success:       true,
-        statusCode:    200,
-        statusMessage: 'OK',
-        records:       latestData.records,
-        lastUpdate:    latestData.lastUpdate,
-        source:        latestData.source,
-        table:         latestData.table
-    });
-});
+    const incoming = (Array.isArray(subnets) ? subnets : [subnets])
+        .map(subnet => subnet.trim())
+        .filter(Boolean);
 
-app.get('/data/page', async (req, res) => {
-    const page       = parseInt(req.query.page)     || 1;
-    const pageSize   = Math.min(parseInt(req.query.pageSize) || 100, 1000);
-    const startIndex = (page - 1) * pageSize;
-
-    console.log(`🏢 Branch requested page ${page}, size ${pageSize}`);
-
-    if (!latestData.records || latestData.records.length === 0) {
-        return res.json({
-            success: true, statusCode: 200, statusMessage: 'OK',
-            records: [], total: 0, page, pageSize, totalPages: 0,
-            message: 'No data available'
-        });
+    const added = [];
+    const alreadyExist = [];
+    for (const subnet of incoming) {
+        if (!whitelistedSubnets.includes(subnet)) {
+            whitelistedSubnets.push(subnet);
+            added.push(subnet);
+        } else {
+            alreadyExist.push(subnet);
+        }
     }
 
-    res.json({
-        success:       true,
-        statusCode:    200,
-        statusMessage: 'OK',
-        records:       latestData.records.slice(startIndex, startIndex + pageSize),
-        total:         latestData.count,
-        page,
-        pageSize,
-        totalPages:    Math.ceil(latestData.count / pageSize),
-        lastUpdate:    latestData.lastUpdate
-    });
-});
-
-app.post('/data/search', async (req, res) => {
-    const { filters = {}, searchTerm = null } = req.body;
-
-    console.log(`🏢 Branch search request`);
-
-    if (!latestData.records || latestData.records.length === 0) {
-        return res.json({ success: true, records: [], count: 0, message: 'No data available' });
-    }
-
-    let results = [...latestData.records];
-
-    if (searchTerm) {
-        const term = searchTerm.toLowerCase();
-        results = results.filter(record =>
-            Object.values(record).some(v => String(v).toLowerCase().includes(term))
-        );
-    }
-
-    if (Object.keys(filters).length > 0) {
-        results = results.filter(record =>
-            Object.entries(filters).every(([key, value]) =>
-                String(record[key]).toLowerCase() === String(value).toLowerCase()
-            )
-        );
-    }
-
-    console.log(`✅ Found ${results.length} matching records`);
-
-    res.json({
-        success:    true,
-        records:    results,
-        count:      results.length,
-        total:      latestData.count,
-        searchTerm: searchTerm || null,
-        filters:    Object.keys(filters).length > 0 ? filters : null
-    });
-});
-
-app.get('/data/find/:field/:value', async (req, res) => {
-    const { field, value } = req.params;
-    console.log(`🏢 Branch searching: ${field} = ${value}`);
-
-    if (!latestData.records || latestData.records.length === 0) {
-        return res.json({ success: true, records: [], count: 0, message: 'No data available' });
-    }
-
-    const matched = latestData.records.filter(record =>
-        String(record[field]).toUpperCase() === String(value).toUpperCase()
-    );
-
-    console.log(`✅ Found ${matched.length} records`);
-    res.json({ success: true, records: matched, count: matched.length, field, value });
-});
-
-app.get('/data/stats', async (req, res) => {
-    console.log(`🏢 Branch requested stats`);
-
-    if (!latestData.records || latestData.records.length === 0) {
-        return res.json({ success: true, hasData: false, message: 'No data available yet.' });
-    }
-
-    const columns = Object.keys(latestData.records[0] || {});
     res.json({
         success: true,
-        hasData: true,
-        stats: {
-            totalRecords: latestData.count,
-            columns,
-            columnCount:  columns.length,
-            lastUpdate:   latestData.lastUpdate,
-            source:       latestData.source,
-            table:        latestData.table
-        }
+        message: `Added ${added.length} subnet(s)`,
+        added: added,
+        already_existed: alreadyExist,
+        subnets: whitelistedSubnets,
+        note: 'Subnets are ideal for large company networks with consistent IP prefixes'
     });
 });
 
-app.get('/data/history', async (req, res) => {
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-    console.log(`🏢 Branch requested history (last ${limit} updates)`);
-    res.json({
-        success:      true,
-        history:      dataHistory.slice(0, limit),
-        totalUpdates: dataHistory.length,
-        currentData:  { recordCount: latestData.count, lastUpdate: latestData.lastUpdate }
-    });
-});
+// DELETE - Remove from whitelist
+app.delete('/whitelist', (req, res) => {
+    const { type, value } = req.body;
+    const clientIp = getClientIp(req);
 
-app.get('/data/export', async (req, res) => {
-    console.log(`🏢 Branch requested data export`);
-    if (!latestData.records || latestData.records.length === 0) {
-        return res.status(404).json({ success: false, message: 'No data available to export' });
-    }
-    res.json({
-        success:      true,
-        exportedAt:   new Date().toISOString(),
-        source:       latestData.source,
-        table:        latestData.table,
-        totalRecords: latestData.count,
-        data:         latestData.records
-    });
-});
+    console.log(`\n🗑️ REMOVE FROM WHITELIST from ${clientIp}`);
+    console.log(`   Type: ${type}, Value: ${value}`);
 
-// ============= WEBSOCKET =============
-io.on('connection', (socket) => {
-    const branchId  = socket.id;
-    const fwd       = socket.handshake.headers['x-forwarded-for'];
-    const clientIp  = fwd ? fwd.split(',')[0].trim() : (socket.handshake.address || 'Unknown');
-    const clientMac = socket.handshake.headers['x-mac-address'] || 'Not provided';
-
-    console.log(`\n🔐 WEBSOCKET CONNECTION:`);
-    console.log(`   📍 Client IP: ${clientIp}`);
-    console.log(`   🖥️  MAC:       ${clientMac}`);
-    console.log(`   🆔 Socket ID: ${branchId}`);
-
-    connectedBranches.set(branchId, socket);
-
-    if (latestData.records && latestData.records.length > 0) {
-        socket.emit('connected', {
-            status: 'connected', message: 'Connected to data relay server',
-            recordCount: latestData.count, lastUpdate: latestData.lastUpdate, hasData: true
-        });
-        socket.emit('data_update', {
-            type: 'initial', timestamp: new Date().toISOString(),
-            records: latestData.records, count: latestData.count, source: latestData.source
-        });
-        console.log(`📤 Sent initial data (${latestData.count} records) to branch ${branchId}`);
-    } else {
-        socket.emit('connected', {
-            status: 'connected',
-            message: 'Connected to data relay server — waiting for data from local PC',
-            hasData: false
+    if (!type || !value) {
+        return res.status(400).json({
+            success: false,
+            error: 'Missing fields: type and value',
+            example: { type: 'static', value: '192.168.1.100' },
+            types: ['static', 'network', 'range', 'subnet']
         });
     }
 
-    socket.on('filter_request', (filters) => {
-        console.log(`🔍 Branch ${branchId} requested filter:`, filters);
-        if (!latestData.records || latestData.records.length === 0) {
-            socket.emit('filter_response', { records: [], count: 0, message: 'No data available' });
-            return;
-        }
-        const filtered = latestData.records.filter(record =>
-            Object.entries(filters).every(([key, value]) =>
-                String(record[key]).toLowerCase().includes(String(value).toLowerCase())
-            )
-        );
-        socket.emit('filter_response', {
-            records: filtered, count: filtered.length,
-            filters, timestamp: new Date().toISOString()
-        });
-        console.log(`📤 Sent ${filtered.length} filtered records to branch ${branchId}`);
-    });
+    let removed = false;
+    let message = '';
 
-    socket.on('refresh_request', () => {
-        console.log(`🔄 Branch ${branchId} requested refresh`);
-        if (latestData.records && latestData.records.length > 0) {
-            socket.emit('data_update', {
-                type: 'refresh', timestamp: new Date().toISOString(),
-                records: latestData.records, count: latestData.count, source: latestData.source
+    switch (type) {
+        case 'static':
+            const staticIndex = whitelistedStaticIps.indexOf(value);
+            if (staticIndex !== -1) {
+                whitelistedStaticIps.splice(staticIndex, 1);
+                removed = true;
+                message = `Removed static IP ${value}`;
+            }
+            break;
+            
+        case 'network':
+            const networkIndex = whitelistedNetworks.indexOf(value);
+            if (networkIndex !== -1) {
+                whitelistedNetworks.splice(networkIndex, 1);
+                removed = true;
+                message = `Removed network ${value}`;
+            }
+            break;
+            
+        case 'range':
+            const [start, end] = value.split('-');
+            const rangeIndex = whitelistedIpRanges.findIndex(r => r.start === start && r.end === end);
+            if (rangeIndex !== -1) {
+                whitelistedIpRanges.splice(rangeIndex, 1);
+                removed = true;
+                message = `Removed IP range ${value}`;
+            }
+            break;
+            
+        case 'subnet':
+            const subnetIndex = whitelistedSubnets.indexOf(value);
+            if (subnetIndex !== -1) {
+                whitelistedSubnets.splice(subnetIndex, 1);
+                removed = true;
+                message = `Removed subnet ${value}`;
+            }
+            break;
+            
+        default:
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid type',
+                types: ['static', 'network', 'range', 'subnet']
             });
+    }
+
+    if (!removed) {
+        return res.status(404).json({
+            success: false,
+            error: `${type} ${value} not found in whitelist`
+        });
+    }
+
+    res.json({
+        success: true,
+        message: message,
+        remaining: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks,
+            ip_ranges: whitelistedIpRanges,
+            subnets: whitelistedSubnets
         }
     });
+});
 
-    socket.on('ping', () => {
-        socket.emit('pong', { timestamp: new Date().toISOString() });
+// ============= ENDPOINT: Check Your Network Status =============
+app.get('/my-network-status', (req, res) => {
+    const clientIp = getClientIp(req);
+    const networkInfo = getNetworkInfo(clientIp);
+    
+    console.log(`\n🌐 NETWORK STATUS CHECK from ${clientIp}`);
+    
+    // Determine recommended configuration for company networks
+    let recommendations = [];
+    if (isIpInPrivateRange(clientIp)) {
+        recommendations.push({
+            type: 'Network Range (CIDR)',
+            value: getRecommendedCidr(clientIp),
+            description: 'Best for company networks with dynamic IPs'
+        });
+        recommendations.push({
+            type: 'Static IP',
+            value: clientIp,
+            description: 'Best for company servers with fixed IPs'
+        });
+        recommendations.push({
+            type: 'IP Range',
+            value: getRecommendedIpRange(clientIp),
+            description: 'Best for company subnets with specific IP allocations'
+        });
+    }
+    
+    res.json({
+        success: true,
+        your_ip: clientIp,
+        network_info: {
+            is_private: isIpInPrivateRange(clientIp),
+            is_whitelisted: networkInfo.is_whitelisted,
+            matching_config: networkInfo.matching_network || 
+                           networkInfo.matching_range || 
+                           networkInfo.matching_subnet || 
+                           'None',
+            is_static_ip: networkInfo.is_static
+        },
+        current_whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks,
+            ip_ranges: whitelistedIpRanges,
+            subnets: whitelistedSubnets
+        },
+        recommendations: recommendations,
+        company_network_config: {
+            static_ip: `WHITELISTED_STATIC_IPS=${clientIp}`,
+            network_range: `WHITELISTED_NETWORKS=${getRecommendedCidr(clientIp)}`,
+            ip_range: `WHITELISTED_IP_RANGES=${getRecommendedIpRange(clientIp)}`,
+            subnet: `WHITELISTED_SUBNETS=${getRecommendedSubnet(clientIp)}`
+        },
+        timestamp: new Date().toISOString()
     });
+});
 
-    socket.on('disconnect', () => {
-        console.log(`🏢 BRANCH OFFICE DISCONNECTED: ${branchId}`);
-        connectedBranches.delete(branchId);
+// ============= HELPER: Get Recommended CIDR =============
+function getRecommendedCidr(ip) {
+    const parts = ip.split('.');
+    if (parts[0] === '192' && parts[1] === '168') {
+        return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+    } else if (parts[0] === '10') {
+        return '10.0.0.0/8';
+    } else if (parts[0] === '172' && parts[1] >= 16 && parts[1] <= 31) {
+        return '172.16.0.0/12';
+    }
+    return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+}
+
+// ============= HELPER: Get Recommended IP Range =============
+function getRecommendedIpRange(ip) {
+    const parts = ip.split('.');
+    return `${parts[0]}.${parts[1]}.${parts[2]}.1-${parts[0]}.${parts[1]}.${parts[2]}.254`;
+}
+
+// ============= HELPER: Get Recommended Subnet =============
+function getRecommendedSubnet(ip) {
+    const parts = ip.split('.');
+    return `${parts[0]}.${parts[1]}.${parts[2]}`;
+}
+
+// ============= OTHER ENDPOINTS =============
+app.get('/', (req, res) => {
+    res.json({
+        name: 'Company Network Authentication Server',
+        status: 'online',
+        version: '2.0.0',
+        authentication: {
+            type: 'Multi-Method Whitelist',
+            methods: [
+                'Static IP Whitelist (Company servers with fixed IPs)',
+                'Network Range Whitelist (Dynamic IPs within company)',
+                'IP Range Whitelist (Specific company subnets)',
+                'Subnet Whitelist (Company network prefixes)'
+            ]
+        },
+        endpoints: {
+            'GET /whitelist': 'View all whitelists',
+            'POST /whitelist/static': 'Add static IPs',
+            'POST /whitelist/network': 'Add network ranges (CIDR)',
+            'POST /whitelist/range': 'Add IP ranges',
+            'POST /whitelist/subnet': 'Add subnets',
+            'DELETE /whitelist': 'Remove from whitelist',
+            'GET /my-network-status': 'Check your network status'
+        },
+        timestamp: new Date().toISOString()
     });
 });
 
 // ============= START SERVER =============
 server.listen(PORT, () => {
-    const networkInfo = getLocalNetworkIps();
     console.log(`
     ═══════════════════════════════════════════════════════
-    🌐 REMOTE RELAY SERVER
+    🏢 COMPANY NETWORK AUTHENTICATION SERVER
     ═══════════════════════════════════════════════════════
     📍 URL:        http://localhost:${PORT}
-    🖥️ Server IPs: ${networkInfo.local_ips.map(ip => ip.address).join(', ') || 'None found'}
-    🔐 IP auth:    ${process.env.ALLOWED_IPS  ? 'ENABLED  → ' + process.env.ALLOWED_IPS  : 'DISABLED (set ALLOWED_IPS in .env)'}
-    🔐 MAC auth:   ${process.env.ALLOWED_MACS ? 'ENABLED  → ' + process.env.ALLOWED_MACS : 'DISABLED (set ALLOWED_MACS in .env)'}
-    🔐 Server IP whitelist: ${process.env.WHITELISTED_SERVER_IPS ? 'ENABLED  → ' + process.env.WHITELISTED_SERVER_IPS : 'DISABLED (set WHITELISTED_SERVER_IPS in .env)'}
     
-    📡 Endpoints:
-       GET  /server-ip      → check if server local IP is whitelisted
-       GET  /server-network → view all network interfaces
-       GET  /white/s/p      → view whitelisted server IPs
-       POST /white/s/p      → add server IPs to whitelist
-       DELETE /white/s/p    → remove server IP from whitelist
-       GET  /my-ip          → see your public IP
-       GET  /my-mac         → verify your MAC
+    🔐 Whitelist Configuration:
+       Static IPs:  ${whitelistedStaticIps.length > 0 ? whitelistedStaticIps.join(', ') : 'None'}
+       Networks:    ${whitelistedNetworks.length > 0 ? whitelistedNetworks.join(', ') : 'None'}
+       IP Ranges:   ${whitelistedIpRanges.length > 0 ? whitelistedIpRanges.map(r => `${r.start}-${r.end}`).join(', ') : 'None'}
+       Subnets:     ${whitelistedSubnets.length > 0 ? whitelistedSubnets.join(', ') : 'None'}
+    
+    📡 Company Network Setup:
+       1. Check your IP:         GET /my-network-status
+       2. Add static IP:         POST /whitelist/static
+       3. Add network range:     POST /whitelist/network
+       4. Add IP range:          POST /whitelist/range
+       5. Add subnet:            POST /whitelist/subnet
+    
+    💡 Example for Company Network:
+       curl -X POST /whitelist/static \\
+         -H "Content-Type: application/json" \\
+         -d '{"ips": ["192.168.1.100", "192.168.1.101"]}'
+       
+       curl -X POST /whitelist/network \\
+         -H "Content-Type: application/json" \\
+         -d '{"networks": ["192.168.1.0/24"]}'
     ═══════════════════════════════════════════════════════
     `);
 });
