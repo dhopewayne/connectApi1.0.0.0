@@ -37,6 +37,11 @@ let allowedIps = process.env.ALLOWED_IPS
     ? process.env.ALLOWED_IPS.split(',').map(ip => ip.trim()).filter(Boolean)
     : [];
 
+// Separate list for server IPs that are whitelisted for internal use
+let whitelistedServerIps = process.env.WHITELISTED_SERVER_IPS
+    ? process.env.WHITELISTED_SERVER_IPS.split(',').map(ip => ip.trim()).filter(Boolean)
+    : [];
+
 // ============= LOGGING =============
 app.use((req, res, next) => {
     console.log(`\n🔵 [${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
@@ -70,32 +75,49 @@ function getClientIp(req) {
     return 'Unknown';
 }
 
-// ============= HELPER: Get Server's Public IP =============
-function getServerPublicIp() {
+// ============= HELPER: Get Local Network IPs =============
+function getLocalNetworkIps() {
     try {
-        // Get all network interfaces
         const interfaces = os.networkInterfaces();
-        const addresses = [];
+        const localIps = [];
+        const allIps = [];
         
         for (const name of Object.keys(interfaces)) {
             for (const iface of interfaces[name]) {
-                // Skip internal and non-IPv4 addresses
+                // Skip internal (localhost) and non-IPv4
                 if (!iface.internal && iface.family === 'IPv4') {
-                    addresses.push(iface.address);
+                    localIps.push({
+                        interface: name,
+                        address: iface.address,
+                        netmask: iface.netmask,
+                        mac: iface.mac
+                    });
+                }
+                
+                // Collect all IPv4 addresses for debugging
+                if (iface.family === 'IPv4') {
+                    allIps.push({
+                        interface: name,
+                        address: iface.address,
+                        internal: iface.internal,
+                        netmask: iface.netmask
+                    });
                 }
             }
         }
         
-        // If we have external addresses, return the first one
-        if (addresses.length > 0) {
-            return addresses[0];
-        }
-        
-        // Fallback to localhost
-        return '127.0.0.1';
+        return {
+            local_ips: localIps,
+            all_ips: allIps,
+            primary_ip: localIps.length > 0 ? localIps[0].address : '127.0.0.1'
+        };
     } catch (error) {
-        console.error('Error getting server IP:', error);
-        return 'Unable to determine server IP';
+        console.error('Error getting local network IPs:', error);
+        return {
+            local_ips: [],
+            all_ips: [],
+            primary_ip: 'Unable to determine'
+        };
     }
 }
 
@@ -105,6 +127,7 @@ function getServerPublicIp() {
 // .env example:
 //   ALLOWED_IPS=41.58.120.5,41.58.120.6
 //   ALLOWED_MACS=AA:BB:CC:DD:EE:FF,11:22:33:44:55:66
+//   WHITELISTED_SERVER_IPS=192.168.1.100,192.168.1.101
 //
 // Rules:
 //   - If ALLOWED_IPS is set   → request's public IP must be in the list
@@ -174,62 +197,255 @@ const authenticateBranch = (req, res, next) => {
 app.use('/testresults', authenticateBranch);
 app.use('/data',        authenticateBranch);
 
-// ============= ENDPOINT: Server IP + Access Check =============
-// Hit this to get the server's public IP and check if it's whitelisted
+// ============= ENDPOINT: Server Local Network IP + Access Check =============
+// Hit this to get the server's local network IP and check if it's whitelisted
 app.get('/server-ip', (req, res) => {
-    const serverIp = getServerPublicIp();
-    const isWhitelisted = allowedIps.includes(serverIp);
+    const networkInfo = getLocalNetworkIps();
+    const primaryIp = networkInfo.primary_ip;
+    const isWhitelisted = whitelistedServerIps.includes(primaryIp);
     
-    console.log(`\n🖥️ SERVER IP REQUEST — IP: ${serverIp} | Whitelisted: ${isWhitelisted}`);
+    console.log(`\n🖥️ SERVER LOCAL IP REQUEST — Primary IP: ${primaryIp} | Whitelisted: ${isWhitelisted}`);
     
-    // Get additional network info
-    const networkInfo = {
-        interfaces: {},
-        publicIp: serverIp,
-        isWhitelisted: isWhitelisted
-    };
+    // Check all local IPs against whitelist
+    const ipStatus = networkInfo.local_ips.map(ip => ({
+        interface: ip.interface,
+        address: ip.address,
+        netmask: ip.netmask,
+        mac: ip.mac,
+        is_whitelisted: whitelistedServerIps.includes(ip.address)
+    }));
     
-    // Get all network interfaces for debugging
-    const interfaces = os.networkInterfaces();
-    for (const name of Object.keys(interfaces)) {
-        networkInfo.interfaces[name] = interfaces[name].map(iface => ({
-            address: iface.address,
-            family: iface.family,
-            internal: iface.internal
-        }));
-    }
-    
-    if (allowedIps.length === 0) {
+    if (whitelistedServerIps.length === 0) {
         return res.status(403).json({
             success: false,
-            server_ip: serverIp,
+            server_local_ips: networkInfo.local_ips.map(ip => ip.address),
+            primary_ip: primaryIp,
             is_whitelisted: false,
-            message: '❌ No IPs have been whitelisted yet. POST to /allowed-ips first.',
-            network_info: networkInfo
+            message: '❌ No server IPs have been whitelisted yet. POST to /white/s/p first.',
+            network_info: networkInfo,
+            suggestion: `Run: curl -X POST /white/s/p -H "Content-Type: application/json" -d '{"ips": ["${primaryIp}"]}'`
         });
     }
     
     if (isWhitelisted) {
         return res.json({
             success: true,
-            server_ip: serverIp,
+            server_local_ips: networkInfo.local_ips.map(ip => ip.address),
+            primary_ip: primaryIp,
             is_whitelisted: true,
-            message: `✅ Server IP (${serverIp}) is whitelisted in ALLOWED_IPS`,
-            network_info: networkInfo,
-            whitelist_count: allowedIps.length,
-            all_whitelisted_ips: allowedIps
+            message: `✅ Server local IP (${primaryIp}) is whitelisted in WHITELISTED_SERVER_IPS`,
+            network_info: {
+                all_interfaces: networkInfo.all_ips,
+                local_interfaces: networkInfo.local_ips
+            },
+            server_whitelist: whitelistedServerIps,
+            whitelist_count: whitelistedServerIps.length
         });
     } else {
         return res.status(403).json({
             success: false,
-            server_ip: serverIp,
+            server_local_ips: networkInfo.local_ips.map(ip => ip.address),
+            primary_ip: primaryIp,
             is_whitelisted: false,
-            message: `❌ Server IP (${serverIp}) is NOT whitelisted. Add it to ALLOWED_IPS via POST /allowed-ips or .env`,
-            network_info: networkInfo,
-            current_whitelist: allowedIps,
-            suggestion: `Run: curl -X POST /allowed-ips -H "Content-Type: application/json" -d '{"ips": ["${serverIp}"]}'`
+            message: `❌ Server local IP (${primaryIp}) is NOT whitelisted. Add it via POST /white/s/p`,
+            network_info: {
+                all_interfaces: networkInfo.all_ips,
+                local_interfaces: networkInfo.local_ips
+            },
+            current_server_whitelist: whitelistedServerIps,
+            suggestion: `Run: curl -X POST /white/s/p -H "Content-Type: application/json" -d '{"ips": ["${primaryIp}"]}'`
         });
     }
+});
+
+// ============= ENDPOINT: Whitelist Server Local IPs =============
+// POST /white/s/p - Add server local IPs to the whitelist
+// Body: { "ips": ["192.168.1.100", "192.168.1.101"] }
+// or:   { "ips": "192.168.1.100" } (single string also accepted)
+// GET  /white/s/p - View all whitelisted server IPs
+// DELETE /white/s/p - Remove a server IP from the whitelist
+
+// GET - View whitelisted server IPs
+app.get('/white/s/p', (req, res) => {
+    const networkInfo = getLocalNetworkIps();
+    const primaryIp = networkInfo.primary_ip;
+    
+    // Check which local IPs are whitelisted
+    const ipStatus = networkInfo.local_ips.map(ip => ({
+        interface: ip.interface,
+        address: ip.address,
+        is_whitelisted: whitelistedServerIps.includes(ip.address)
+    }));
+    
+    res.json({
+        success: true,
+        count: whitelistedServerIps.length,
+        whitelisted_server_ips: whitelistedServerIps,
+        current_server: {
+            primary_ip: primaryIp,
+            all_local_ips: networkInfo.local_ips.map(ip => ip.address),
+            is_primary_whitelisted: whitelistedServerIps.includes(primaryIp),
+            ip_status: ipStatus
+        },
+        note: whitelistedServerIps.length === 0
+            ? 'No server IPs have been whitelisted yet'
+            : 'These server local IPs are allowed for internal operations',
+        usage: {
+            add: 'POST /white/s/p with { "ips": ["192.168.1.100", "192.168.1.101"] }',
+            remove: 'DELETE /white/s/p with { "ip": "192.168.1.100" }',
+            view: 'GET /white/s/p'
+        }
+    });
+});
+
+// POST - Add server local IPs to whitelist
+app.post('/white/s/p', (req, res) => {
+    const { ips } = req.body;
+    const clientIp = getClientIp(req);
+    const networkInfo = getLocalNetworkIps();
+
+    console.log(`\n📋 WHITELIST SERVER IPs REQUEST from ${clientIp}`);
+    console.log(`   Request body:`, req.body);
+
+    if (!ips) {
+        return res.status(400).json({
+            success: false,
+            error: 'Missing field: ips',
+            example: { ips: ['192.168.1.100', '192.168.1.101'] },
+            note: 'You can also provide a single IP as a string: { "ips": "192.168.1.100" }'
+        });
+    }
+
+    // Accept either a single string or an array
+    const incoming = (Array.isArray(ips) ? ips : [ips])
+        .map(ip => ip.trim())
+        .filter(Boolean);
+
+    if (incoming.length === 0) {
+        return res.status(400).json({
+            success: false,
+            error: 'No valid IPs provided'
+        });
+    }
+
+    // Validate IP format (basic validation)
+    const invalidIps = [];
+    const validIps = [];
+    for (const ip of incoming) {
+        // Simple IPv4 validation
+        const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+        if (ipv4Regex.test(ip) && ip.split('.').every(num => parseInt(num) >= 0 && parseInt(num) <= 255)) {
+            validIps.push(ip);
+        } else {
+            invalidIps.push(ip);
+        }
+    }
+
+    if (validIps.length === 0) {
+        return res.status(400).json({
+            success: false,
+            error: 'No valid IPv4 addresses provided',
+            invalid_ips: invalidIps,
+            hint: 'Please provide valid IPv4 addresses (e.g., 192.168.1.100)'
+        });
+    }
+
+    // Add only new ones (no duplicates)
+    const added = [];
+    const alreadyExist = [];
+    for (const ip of validIps) {
+        if (!whitelistedServerIps.includes(ip)) {
+            whitelistedServerIps.push(ip);
+            added.push(ip);
+        } else {
+            alreadyExist.push(ip);
+        }
+    }
+
+    console.log(`\n📋 WHITELISTED SERVER IPs UPDATED — added: ${added.join(', ') || 'none'}`);
+    console.log(`   Already existed: ${alreadyExist.join(', ') || 'none'}`);
+    console.log(`   Invalid: ${invalidIps.join(', ') || 'none'}`);
+    console.log(`   Full server whitelist: ${whitelistedServerIps.join(', ')}`);
+
+    // Also check if the current server IP is now whitelisted
+    const primaryIp = networkInfo.primary_ip;
+    const isCurrentWhitelisted = whitelistedServerIps.includes(primaryIp);
+
+    res.json({
+        success: true,
+        message: `Successfully added ${added.length} server IP(s) to the whitelist`,
+        added: added,
+        already_existed: alreadyExist,
+        invalid: invalidIps,
+        total_server_ips: whitelistedServerIps.length,
+        whitelisted_server_ips: whitelistedServerIps,
+        current_server: {
+            primary_ip: primaryIp,
+            all_local_ips: networkInfo.local_ips.map(ip => ip.address),
+            is_whitelisted: isCurrentWhitelisted
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+// DELETE - Remove a server IP from whitelist
+app.delete('/white/s/p', (req, res) => {
+    const { ip } = req.body;
+    const clientIp = getClientIp(req);
+
+    console.log(`\n🗑️ REMOVE SERVER IP from whitelist — Request from ${clientIp}`);
+    console.log(`   IP to remove: ${ip}`);
+
+    if (!ip) {
+        return res.status(400).json({
+            success: false,
+            error: 'Missing field: ip',
+            example: { ip: '192.168.1.100' }
+        });
+    }
+
+    const trimmedIp = ip.trim();
+    const index = whitelistedServerIps.indexOf(trimmedIp);
+    
+    if (index === -1) {
+        return res.status(404).json({
+            success: false,
+            error: `IP ${trimmedIp} not found in server whitelist`,
+            current_server_ips: whitelistedServerIps
+        });
+    }
+
+    whitelistedServerIps.splice(index, 1);
+    
+    console.log(`   ✅ Removed ${trimmedIp} from server whitelist`);
+    console.log(`   Updated list: ${whitelistedServerIps.join(', ') || '(empty)'}`);
+
+    const networkInfo = getLocalNetworkIps();
+
+    res.json({
+        success: true,
+        message: `Successfully removed ${trimmedIp} from server whitelist`,
+        removed: trimmedIp,
+        remaining_server_ips: whitelistedServerIps,
+        count: whitelistedServerIps.length,
+        current_server: {
+            primary_ip: networkInfo.primary_ip,
+            all_local_ips: networkInfo.local_ips.map(ip => ip.address)
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ============= ENDPOINT: Get Server Network Info =============
+// Useful for debugging - shows all network interfaces
+app.get('/server-network', (req, res) => {
+    const networkInfo = getLocalNetworkIps();
+    res.json({
+        success: true,
+        network_info: networkInfo,
+        whitelisted_server_ips: whitelistedServerIps,
+        timestamp: new Date().toISOString()
+    });
 });
 
 // ============= ENDPOINT: My IP + Access Check =============
@@ -279,18 +495,6 @@ app.get('/allowed-ips', (req, res) => {
         allowed_ips: allowedIps,
         note:        allowedIps.length === 0
             ? 'List is empty — all IPs are currently allowed (open access)'
-            : 'Only these public IPs can access protected endpoints'
-    });
-});
-
-// ============= ENDPOINT: Allowed IPs =============
-app.get('/allowed-ips', (req, res) => {
-    res.json({
-        success:     true,
-        count:       allowedIps.length,
-        allowed_ips: allowedIps,
-        note:        allowedIps.length === 0
-            ? 'List is empty — ALL access is currently blocked until IPs are added'
             : 'Only these public IPs can access protected endpoints'
     });
 });
@@ -390,18 +594,30 @@ app.get('/my-mac', (req, res) => {
 
 // ============= ROOT ENDPOINT =============
 app.get('/', (req, res) => {
+    const networkInfo = getLocalNetworkIps();
     res.json({
         name: 'Remote Data Relay Server',
         status: 'online',
         version: '1.0.0',
         auth_mode: {
             ip_whitelist:  process.env.ALLOWED_IPS  ? 'ENABLED'  : 'DISABLED (set ALLOWED_IPS in .env)',
-            mac_whitelist: process.env.ALLOWED_MACS ? 'ENABLED'  : 'DISABLED (set ALLOWED_MACS in .env)'
+            mac_whitelist: process.env.ALLOWED_MACS ? 'ENABLED'  : 'DISABLED (set ALLOWED_MACS in .env)',
+            server_whitelist: process.env.WHITELISTED_SERVER_IPS ? 'ENABLED' : 'DISABLED (set WHITELISTED_SERVER_IPS in .env)'
+        },
+        server_info: {
+            local_ips: networkInfo.local_ips.map(ip => ip.address),
+            primary_ip: networkInfo.primary_ip
         },
         discovery_endpoints: {
-            server_ip:      'GET /server-ip   — get server IP and check if whitelisted',
+            server_ip:      'GET /server-ip   — get server local IP and check if whitelisted',
+            server_network: 'GET /server-network — view all network interfaces',
             my_public_ip:   'GET /my-ip   — open in browser to find your public IP',
             my_mac:         'GET /my-mac  — send x-mac-address header to verify your MAC'
+        },
+        server_ip_management: {
+            view:   'GET /white/s/p     — view all whitelisted server IPs',
+            add:    'POST /white/s/p    — add server IPs to whitelist',
+            remove: 'DELETE /white/s/p  — remove server IP from whitelist'
         },
         protected_endpoints: {
             receive_stream: 'POST /data/realtimedata',
@@ -413,7 +629,7 @@ app.get('/', (req, res) => {
             history:        'GET  /data/history',
             health:         'GET  /data/health'
         },
-        websocket:  'wss://' + req.get('host'),
+        websocket:  'ws://' + req.get('host'),
         timestamp:  new Date().toISOString()
     });
 });
@@ -427,6 +643,7 @@ app.get('/data/health', (req, res) => {
         lastUpdate:        latestData.lastUpdate,
         connectedBranches: connectedBranches.size,
         historySize:       dataHistory.length,
+        serverWhitelist:   whitelistedServerIps,
         timestamp:         new Date().toISOString()
     });
 });
@@ -723,18 +940,25 @@ io.on('connection', (socket) => {
 
 // ============= START SERVER =============
 server.listen(PORT, () => {
-    const serverIp = getServerPublicIp();
+    const networkInfo = getLocalNetworkIps();
     console.log(`
     ═══════════════════════════════════════════════════════
     🌐 REMOTE RELAY SERVER
     ═══════════════════════════════════════════════════════
-    📍 URL:        ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}
-    🖥️ Server IP:  ${serverIp}
+    📍 URL:        http://localhost:${PORT}
+    🖥️ Server IPs: ${networkInfo.local_ips.map(ip => ip.address).join(', ') || 'None found'}
     🔐 IP auth:    ${process.env.ALLOWED_IPS  ? 'ENABLED  → ' + process.env.ALLOWED_IPS  : 'DISABLED (set ALLOWED_IPS in .env)'}
     🔐 MAC auth:   ${process.env.ALLOWED_MACS ? 'ENABLED  → ' + process.env.ALLOWED_MACS : 'DISABLED (set ALLOWED_MACS in .env)'}
-    📡 GET /server-ip → check if server IP is whitelisted
-    📡 GET /my-ip     → see your public IP (use this in ALLOWED_IPS)
-    📡 GET /my-mac    → verify your MAC  (use this in ALLOWED_MACS)
+    🔐 Server IP whitelist: ${process.env.WHITELISTED_SERVER_IPS ? 'ENABLED  → ' + process.env.WHITELISTED_SERVER_IPS : 'DISABLED (set WHITELISTED_SERVER_IPS in .env)'}
+    
+    📡 Endpoints:
+       GET  /server-ip      → check if server local IP is whitelisted
+       GET  /server-network → view all network interfaces
+       GET  /white/s/p      → view whitelisted server IPs
+       POST /white/s/p      → add server IPs to whitelist
+       DELETE /white/s/p    → remove server IP from whitelist
+       GET  /my-ip          → see your public IP
+       GET  /my-mac         → verify your MAC
     ═══════════════════════════════════════════════════════
     `);
 });
