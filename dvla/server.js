@@ -124,37 +124,174 @@ function isIpInWhitelistedNetwork(ip) {
 }
 
 // ============= HELPER: Get Network Info with Router ID =============
+// function getNetworkInfo(ip) {
+//     const info = {
+//         ip: ip,
+//         router_id: null,
+//         network_range: null,
+//         is_private: false,
+//         is_whitelisted: false,
+//         whitelist_method: null,
+//         network_type: 'unknown'
+//     };
+
+//     // Check if private
+//     info.is_private = isIpInPrivateRange(ip);
+
+//     // Get router ID (Gateway) - typically .1 in the subnet
+//     if (ip && ip !== 'Unknown') {
+//         const parts = ip.split('.');
+//         if (parts.length === 4) {
+//             // Router is usually .1 or .254 in the subnet
+//             // Try .1 first (most common)
+//             info.router_id = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
+            
+//             // Get network range
+//             info.network_range = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+//         }
+//     }
+
+//     // Check if IP is whitelisted (static IP)
+//     if (whitelistedStaticIps.includes(ip)) {
+//         info.is_whitelisted = true;
+//         info.whitelist_method = 'Static IP';
+//         return info;
+//     }
+
+//     // Check if IP is in whitelisted network
+//     if (isIpInWhitelistedNetwork(ip)) {
+//         info.is_whitelisted = true;
+//         info.whitelist_method = 'Network Range';
+//         return info;
+//     }
+
+//     // Determine network type
+//     if (info.is_private) {
+//         if (ip.startsWith('192.168.')) {
+//             info.network_type = 'Private (Class C)';
+//         } else if (ip.startsWith('10.')) {
+//             info.network_type = 'Private (Class A)';
+//         } else if (ip.startsWith('172.')) {
+//             info.network_type = 'Private (Class B)';
+//         } else if (ip.startsWith('127.')) {
+//             info.network_type = 'Localhost';
+//         }
+//     } else {
+//         info.network_type = 'Public';
+//     }
+
+//     return info;
+// }
+
+// ============= ENDPOINT: Check My Network Status =============
+// This is the endpoint you hit from your company PC
+// It shows your local PC IP, router ID, and if you're whitelisted
+// app.get('/my-network-check', (req, res) => {
+//     const clientIp = getClientIp(req);
+//     const networkInfo = getNetworkInfo(clientIp);
+    
+//     console.log(`\n🖥️ NETWORK CHECK from ${clientIp}`);
+//     console.log(`   Router ID: ${networkInfo.router_id}`);
+//     console.log(`   Whitelisted: ${networkInfo.is_whitelisted}`);
+    
+//     // Get all network interfaces for this PC (server-side)
+//     const serverInterfaces = getServerNetworkInterfaces();
+    
+//     res.json({
+//         success: true,
+//         your_network: {
+//             // Your PC's local IP (what the server sees)
+//             local_pc_ip: clientIp,
+            
+//             // Your router/gateway ID
+//             router_id: networkInfo.router_id,
+            
+//             // Your network range
+//             network_range: networkInfo.network_range,
+            
+//             // Network type
+//             network_type: networkInfo.network_type,
+            
+//             // Is this a private network?
+//             is_private: networkInfo.is_private,
+            
+//             // Are you whitelisted?
+//             is_whitelisted: networkInfo.is_whitelisted,
+            
+//             // How you're whitelisted (if applicable)
+//             whitelist_method: networkInfo.whitelist_method
+//         },
+        
+//         whitelist_status: {
+//             status: networkInfo.is_whitelisted ? '✅ ALLOWED' : '❌ DENIED',
+//             message: networkInfo.is_whitelisted 
+//                 ? `Your PC (${clientIp}) is authorized to access this server`
+//                 : `Your PC (${clientIp}) is NOT authorized to access this server`
+//         },
+        
+//         // Server's network info for reference
+//         server_network: {
+//             server_local_ips: serverInterfaces,
+//             whitelisted_networks: whitelistedNetworks,
+//             whitelisted_static_ips: whitelistedStaticIps
+//         },
+        
+//         // Helpful actions
+//         actions: {
+//             if_not_whitelisted: {
+//                 method_1: `Add your IP as static: WHITELISTED_STATIC_IPS=${clientIp}`,
+//                 method_2: `Add your network: WHITELISTED_NETWORKS=${networkInfo.network_range || '192.168.1.0/24'}`,
+//                 method_3: `POST to /whitelist/static with: { "ips": ["${clientIp}"] }`,
+//                 method_4: `POST to /whitelist/network with: { "networks": ["${networkInfo.network_range || '192.168.1.0/24'}"] }`
+//             }
+//         },
+        
+//         timestamp: new Date().toISOString()
+//     });
+// });  
+
+
+
+
+
+
+// ============= HELPER: Get Network Info with Better Detection =============
 function getNetworkInfo(ip) {
     const info = {
         ip: ip,
         router_id: null,
         network_range: null,
+        subnet_mask: null,
         is_private: false,
         is_whitelisted: false,
         whitelist_method: null,
-        network_type: 'unknown'
+        network_type: 'unknown',
+        recommendation: null
     };
 
     // Check if private
     info.is_private = isIpInPrivateRange(ip);
 
-    // Get router ID (Gateway) - typically .1 in the subnet
+    // Get network details
     if (ip && ip !== 'Unknown') {
         const parts = ip.split('.');
         if (parts.length === 4) {
-            // Router is usually .1 or .254 in the subnet
-            // Try .1 first (most common)
+            // Router is usually .1 in the subnet
             info.router_id = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
             
-            // Get network range
+            // Network range
             info.network_range = `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+            
+            // Subnet mask (default for /24)
+            info.subnet_mask = '255.255.255.0';
         }
     }
 
     // Check if IP is whitelisted (static IP)
     if (whitelistedStaticIps.includes(ip)) {
         info.is_whitelisted = true;
-        info.whitelist_method = 'Static IP';
+        info.whitelist_method = 'Static IP (Recommended for your setup)';
+        info.recommendation = 'Your IP is whitelisted as a static IP';
         return info;
     }
 
@@ -162,30 +299,31 @@ function getNetworkInfo(ip) {
     if (isIpInWhitelistedNetwork(ip)) {
         info.is_whitelisted = true;
         info.whitelist_method = 'Network Range';
+        info.recommendation = 'Your network is whitelisted';
         return info;
     }
 
-    // Determine network type
+    // Determine network type and recommendation
     if (info.is_private) {
         if (ip.startsWith('192.168.')) {
-            info.network_type = 'Private (Class C)';
+            info.network_type = 'Private (Class C - Home/Office)';
+            info.recommendation = 'Add your network range or static IP';
         } else if (ip.startsWith('10.')) {
-            info.network_type = 'Private (Class A)';
+            info.network_type = 'Private (Class A - Large Network)';
+            info.recommendation = 'Add your network range or static IP';
         } else if (ip.startsWith('172.')) {
-            info.network_type = 'Private (Class B)';
-        } else if (ip.startsWith('127.')) {
-            info.network_type = 'Localhost';
+            info.network_type = 'Private (Class B - Medium Network)';
+            info.recommendation = 'Add your network range or static IP';
         }
     } else {
-        info.network_type = 'Public';
+        info.network_type = `Public IP (${ip}) - Likely a Company Static IP`;
+        info.recommendation = 'Since this is a public static IP, add it as a STATIC IP, not a network range';
     }
 
     return info;
 }
 
-// ============= ENDPOINT: Check My Network Status =============
-// This is the endpoint you hit from your company PC
-// It shows your local PC IP, router ID, and if you're whitelisted
+// ============= ENDPOINT: Check My Network Status (Enhanced) =============
 app.get('/my-network-check', (req, res) => {
     const clientIp = getClientIp(req);
     const networkInfo = getNetworkInfo(clientIp);
@@ -193,21 +331,22 @@ app.get('/my-network-check', (req, res) => {
     console.log(`\n🖥️ NETWORK CHECK from ${clientIp}`);
     console.log(`   Router ID: ${networkInfo.router_id}`);
     console.log(`   Whitelisted: ${networkInfo.is_whitelisted}`);
-    
-    // Get all network interfaces for this PC (server-side)
-    const serverInterfaces = getServerNetworkInterfaces();
+    console.log(`   Network Type: ${networkInfo.network_type}`);
     
     res.json({
         success: true,
         your_network: {
-            // Your PC's local IP (what the server sees)
+            // Your PC's IP
             local_pc_ip: clientIp,
             
-            // Your router/gateway ID
+            // Your router/gateway
             router_id: networkInfo.router_id,
             
             // Your network range
             network_range: networkInfo.network_range,
+            
+            // Subnet mask
+            subnet_mask: networkInfo.subnet_mask,
             
             // Network type
             network_type: networkInfo.network_type,
@@ -219,7 +358,10 @@ app.get('/my-network-check', (req, res) => {
             is_whitelisted: networkInfo.is_whitelisted,
             
             // How you're whitelisted (if applicable)
-            whitelist_method: networkInfo.whitelist_method
+            whitelist_method: networkInfo.whitelist_method,
+            
+            // Recommendation
+            recommendation: networkInfo.recommendation
         },
         
         whitelist_status: {
@@ -229,21 +371,48 @@ app.get('/my-network-check', (req, res) => {
                 : `Your PC (${clientIp}) is NOT authorized to access this server`
         },
         
-        // Server's network info for reference
-        server_network: {
-            server_local_ips: serverInterfaces,
-            whitelisted_networks: whitelistedNetworks,
-            whitelisted_static_ips: whitelistedStaticIps
+        // ⭐ IMPORTANT: Based on your network type, this shows the BEST method
+        recommended_action: networkInfo.is_private ? {
+            method: 'Network Range (CIDR)',
+            value: networkInfo.network_range,
+            command: `curl -X POST /whitelist/network -H "Content-Type: application/json" -d '{"networks": ["${networkInfo.network_range}"]}'`,
+            note: 'Use network range if other PCs in your company need access'
+        } : {
+            method: 'Static IP (Recommended for your setup)',
+            value: clientIp,
+            command: `curl -X POST /whitelist/static -H "Content-Type: application/json" -d '{"ips": ["${clientIp}"]}'`,
+            note: 'Use static IP since your IP is public and fixed'
         },
         
-        // Helpful actions
+        // All possible actions
         actions: {
-            if_not_whitelisted: {
-                method_1: `Add your IP as static: WHITELISTED_STATIC_IPS=${clientIp}`,
-                method_2: `Add your network: WHITELISTED_NETWORKS=${networkInfo.network_range || '192.168.1.0/24'}`,
-                method_3: `POST to /whitelist/static with: { "ips": ["${clientIp}"] }`,
-                method_4: `POST to /whitelist/network with: { "networks": ["${networkInfo.network_range || '192.168.1.0/24'}"] }`
+            // For static IP (RECOMMENDED for you)
+            add_static_ip: {
+                method: `Add your IP as a static IP`,
+                value: clientIp,
+                command: `curl -X POST /whitelist/static -H "Content-Type: application/json" -d '{"ips": ["${clientIp}"]}'`,
+                why: 'Your IP is public and static - this is the most secure method'
+            },
+            
+            // For network range (if others need access)
+            add_network_range: {
+                method: `Add your network range`,
+                value: networkInfo.network_range,
+                command: `curl -X POST /whitelist/network -H "Content-Type: application/json" -d '{"networks": ["${networkInfo.network_range}"]}'`,
+                why: 'Use this if other PCs in your company need access (IPs in the same range)'
+            },
+            
+            // Environment variable method
+            env_method: {
+                static_ip: `WHITELISTED_STATIC_IPS=${clientIp}`,
+                network_range: `WHILISTED_NETWORKS=${networkInfo.network_range}`
             }
+        },
+        
+        // Server's current whitelist
+        server_whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks
         },
         
         timestamp: new Date().toISOString()
