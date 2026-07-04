@@ -258,7 +258,7 @@ app.use((req, res, next) => {
 
 /**
  * Middleware to authenticate and check whitelist
- * Returns 401 if IP is not whitelisted
+ * Returns 403 if IP is not whitelisted
  */
 const authenticateBranch = async (req, res, next) => {
     const networkInfo = getClientNetworkInfo(req);
@@ -324,27 +324,41 @@ app.get('/whitelist', (req, res) => {
 
 /**
  * Add static IPs to whitelist
- * Body: { ips: ['192.168.1.100', '10.0.0.5'] }
+ * Supports both formats:
+ * 1. { ips: ['192.168.1.100', '10.0.0.5'] }
+ * 2. { ipData: [{ ipAddress: '192.168.1.100', name: 'Test' }] }
  */
 app.post('/whitelist/static', (req, res) => {
-    const { ips } = req.body;
+    let ipsToAdd = [];
     
-    if (!ips) {
+    // Check if the request is from the local server (ipData format)
+    if (req.body.ipData && Array.isArray(req.body.ipData)) {
+        // Extract IP addresses from ipData array
+        ipsToAdd = req.body.ipData
+            .map(item => item.ipAddress || item.ip)
+            .filter(Boolean);
+        
+        console.log(`📥 Received IP data from local server: ${ipsToAdd.length} IPs`);
+    } 
+    // Check if it's the standard format
+    else if (req.body.ips) {
+        const ips = Array.isArray(req.body.ips) ? req.body.ips : [req.body.ips];
+        ipsToAdd = ips.map(ip => ip.trim()).filter(Boolean);
+    }
+    
+    if (ipsToAdd.length === 0) {
         return res.status(400).json({
             success: false,
-            error: 'Missing field: ips',
-            example: { ips: ['192.168.1.100', '10.0.0.5'] }
+            error: 'Missing field: ips or ipData',
+            example: { ips: ['192.168.1.100', '10.0.0.5'] },
+            example2: { ipData: [{ ipAddress: '192.168.1.100', name: 'Test' }] }
         });
     }
-
-    const incoming = (Array.isArray(ips) ? ips : [ips])
-        .map(ip => ip.trim())
-        .filter(Boolean);
 
     const added = [];
     const alreadyExist = [];
     
-    for (const ip of incoming) {
+    for (const ip of ipsToAdd) {
         if (!whitelistedStaticIps.includes(ip)) {
             whitelistedStaticIps.push(ip);
             added.push(ip);
