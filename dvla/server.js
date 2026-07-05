@@ -270,12 +270,10 @@ const authenticateBranch = async (req, res, next) => {
     req.isWhitelisted = isWhitelisted;
     req.networkInfo = networkInfo;
     
-    // Log the authentication attempt
-    console.log(`🔐 AUTH CHECK: ${clientIp} -> Whitelisted: ${isWhitelisted}`);
     
     // Check if whitelisted
     if (!isWhitelisted) {
-        console.log(`❌ ACCESS DENIED: ${clientIp} is not whitelisted`);
+        console.log(`❌ ENDPOINT ACCESS DENIED`);
         
         // Update PC record with failed attempt
         if (pcAccessLog.has(clientIp)) {
@@ -287,15 +285,11 @@ const authenticateBranch = async (req, res, next) => {
         
         return res.status(403).json({
             success: false,
-            error: 'Access Denied - IP not whitelisted',
-            your_ip: clientIp,
-            message: `Your IP (${clientIp}) is not authorized to access this endpoint`,
-            whitelist_hint: 'Contact administrator to add your IP to the whitelist',
+            error: 'Access Denied',
+            message: `contact network administrator for clarification`,
             timestamp: new Date().toISOString()
         });
     }
-    
-    console.log(`✅ ACCESS GRANTED: ${clientIp} is whitelisted`);
     next();
 };
 
@@ -458,7 +452,7 @@ app.delete('/whitelist', (req, res) => {
         });
     }
 
-    let removed = false;
+    let removed = false;    
 
     if (type === 'static') {
         const index = whitelistedStaticIps.indexOf(value);
@@ -483,7 +477,23 @@ app.delete('/whitelist', (req, res) => {
                 pcAccessLog.set(ip, record);
             }
         }
-    }
+        } else { 
+        const index = whitelistedStaticIps.indexOf(value);
+        if (index !== -1) {
+            whitelistedStaticIps.splice(index, 1);
+            removed = true;
+            // Update PC record
+            if (pcAccessLog.has(value)) {
+                const record = pcAccessLog.get(value);
+                record.is_whitelisted = false;
+                pcAccessLog.set(value, record);
+            }
+        }
+
+
+
+
+        }
 
     if (!removed) {
         return res.status(404).json({
@@ -658,11 +668,8 @@ app.get('/testresults', authenticateBranch, (req, res) => {
         return res.json({
             success: true,
             message: 'No data available yet',
-            your_ip: req.clientIp,
-            is_whitelisted: req.isWhitelisted,
             data: {
                 records: [],
-                count: 0,
                 lastUpdate: null
             },
             timestamp: new Date().toISOString()
@@ -671,14 +678,9 @@ app.get('/testresults', authenticateBranch, (req, res) => {
     
     res.json({
         success: true,
-        message: 'Protected test results endpoint',
-        your_ip: req.clientIp,
-        is_whitelisted: req.isWhitelisted,
+        message: 'data retrieved successfully',
         data: {
             records: latestData.records,
-            count: latestData.count,
-            source: latestData.source,
-            table: latestData.table,
             lastUpdate: latestData.lastUpdate
         },
         timestamp: new Date().toISOString()
@@ -690,13 +692,13 @@ app.get('/testresults', authenticateBranch, (req, res) => {
  * GET /data - Returns all records
  */
 app.get('/data', authenticateBranch, (req, res) => {
-    console.log(`📊 DATA requested by ${req.clientIp}`);
+    // console.log(`📊 DATA requested by ${req.clientIp}`);
     
     res.json({
         success: true,
         message: 'Protected data endpoint',
-        your_ip: req.clientIp,
-        is_whitelisted: req.isWhitelisted,
+        // your_ip: req.clientIp,
+        // is_whitelisted: req.isWhitelisted,
         records: latestData.records || [],       
         timestamp: new Date().toISOString()
     });
@@ -706,7 +708,7 @@ app.get('/data', authenticateBranch, (req, res) => {
  * DATA endpoint - Protected by whitelist
  * POST /data/realtimedata - Receive data from local PC
  */
-app.post('/data/realtimedata', authenticateBranch, async (req, res) => {
+app.post('/data/realtimedata', async (req, res) => {
     const { timestamp, records, count, source, table } = req.body;
     const sourceSecret = req.headers['x-source-secret'];
     const expectedSecret = process.env.REMOTE_SECRET;
@@ -740,9 +742,9 @@ app.post('/data/realtimedata', authenticateBranch, async (req, res) => {
     latestData = {
         records: records,
         lastUpdate: new Date().toISOString(),
-        source: source || 'local_pc',
-        table: table || 'unknown',
-        count: records.length,
+        // source: source || 'local_pc',
+        // table: table || 'unknown',
+        // count: records.length,
         receivedAt: timestamp || new Date().toISOString()
     };
 
@@ -756,17 +758,17 @@ app.post('/data/realtimedata', authenticateBranch, async (req, res) => {
 
     if (dataHistory.length > MAX_HISTORY) dataHistory.pop();
 
-    console.log(`✅ Data stored: ${records.length} records`);
+    // console.log(`✅ Data stored: ${records.length} records`);
 
     // Broadcast to connected branches
     const broadcastPayload = {
         type: 'live_update',
         timestamp: new Date().toISOString(),
-        records: records,
-        count: records.length,
-        source: source || 'local_pc',
-        table: table || 'unknown',
-        from_ip: req.clientIp
+        records: records
+        // count: records.length,
+        // source: source || 'local_pc',
+        // table: table || 'unknown',
+        // from_ip: req.clientIp
     };
 
     let branchesNotified = 0;
@@ -779,14 +781,14 @@ app.post('/data/realtimedata', authenticateBranch, async (req, res) => {
         }
     }
 
-    console.log(`📢 Broadcast to ${branchesNotified} connected branch offices`);
+    // console.log(`📢 Broadcast to ${branchesNotified} connected branch offices`);
 
     res.json({
         success: true,
         received: records.length,
         stored: true,
         branchesNotified: branchesNotified,
-        your_ip: req.clientIp,
+        // your_ip: req.clientIp,
         timestamp: new Date().toISOString()
     });
 });
@@ -803,7 +805,7 @@ app.get('/history', authenticateBranch, (req, res) => {
     
     res.json({
         success: true,
-        your_ip: req.clientIp,
+        // your_ip: req.clientIp,
         history: dataHistory.slice(0, parseInt(limit)),
         total: dataHistory.length,
         timestamp: new Date().toISOString()
@@ -823,32 +825,32 @@ app.get('/', (req, res) => {
         status: 'online',
         version: '3.0.0',
         total_pcs_tracked: pcAccessLog.size,
-        your_network: {
-            client_ip: networkInfo.client_ip,
-            ip_chain: networkInfo.ip_chain,
-            socket_ip: networkInfo.socket.remoteAddress,
-            is_whitelisted: isWhitelisted
-        },
-        endpoints: {
-            'GET /': 'Server information',
-            'GET /my-pc-check': 'Show your PC network information',
-            'GET /all-pcs': 'Show ALL PCs that have accessed this server',
-            'GET /pc/:ip': 'Show details for a specific PC',
-            'DELETE /all-pcs': 'Clear PC access log',
-            'GET /whitelist': 'View whitelist',
-            'POST /whitelist/static': 'Add static IPs to whitelist',
-            'POST /whitelist/network': 'Add network ranges to whitelist',
-            'DELETE /whitelist': 'Remove from whitelist',
-            'GET /testresults': 'Get test results (WHITELIST PROTECTED)',
-            'GET /data': 'Get data (WHITELIST PROTECTED)',
-            'POST /data/realtimedata': 'Receive data stream (WHITELIST PROTECTED)',
-            'GET /history': 'View data history (WHITELIST PROTECTED)'
-        },
-        protected_endpoints: {
-            '/testresults': 'Requires whitelisted IP',
-            '/data': 'Requires whitelisted IP',
-            '/data/realtimedata': 'Requires whitelisted IP'
-        },
+        // your_network: {
+        //     client_ip: networkInfo.client_ip,
+        //     ip_chain: networkInfo.ip_chain,
+        //     socket_ip: networkInfo.socket.remoteAddress,
+        //     is_whitelisted: isWhitelisted
+        // },
+        // endpoints: {
+        //     'GET /': 'Server information',
+        //     'GET /my-pc-check': 'Show your PC network information',
+        //     'GET /all-pcs': 'Show ALL PCs that have accessed this server',
+        //     'GET /pc/:ip': 'Show details for a specific PC',
+        //     'DELETE /all-pcs': 'Clear PC access log',
+        //     'GET /whitelist': 'View whitelist',
+        //     'POST /whitelist/static': 'Add static IPs to whitelist',
+        //     'POST /whitelist/network': 'Add network ranges to whitelist',
+        //     'DELETE /whitelist': 'Remove from whitelist',
+        //     'GET /testresults': 'Get test results (WHITELIST PROTECTED)',
+        //     'GET /data': 'Get data (WHITELIST PROTECTED)',
+        //     'POST /data/realtimedata': 'Receive data stream (WHITELIST PROTECTED)',
+        //     'GET /history': 'View data history (WHITELIST PROTECTED)'
+        // },
+        // protected_endpoints: {
+        //     '/testresults': 'Requires whitelisted IP',
+        //     '/data': 'Requires whitelisted IP',
+        //     '/data/realtimedata': 'Requires whitelisted IP'
+        // },
         timestamp: new Date().toISOString()
     });
 });
@@ -978,41 +980,50 @@ process.on('SIGINT', () => {
 // ============================================================
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`
+    // console.log(`
+    // ═══════════════════════════════════════════════════════
+    // 🖥️  PC TRACKING & AUTHENTICATION SERVER
+    // ═══════════════════════════════════════════════════════
+    // 📍 URL:        http://0.0.0.0:${PORT}
+    
+    // 🔐 PROTECTED ENDPOINTS (Require Whitelist):
+    //    GET  /testresults  → View test results
+    //    GET  /data         → View all data
+    //    POST /data/realtimedata → Receive data stream
+    
+    // 📡 PC TRACKING ENDPOINTS:
+    //    GET  /all-pcs      → See every PC that has connected
+    //    GET  /pc/:ip       → See details for a specific PC
+    //    GET  /my-pc-check  → Check your own PC status
+    //    DELETE /all-pcs    → Clear PC access log
+    
+    // 🔑 WHITELIST MANAGEMENT:
+    //    GET    /whitelist           → View whitelist
+    //    POST   /whitelist/static    → Add static IPs
+    //    POST   /whitelist/network   → Add network ranges
+    //    DELETE /whitelist           → Remove from whitelist
+    
+    // 💡 Test from your PC:
+    //    curl http://localhost:${PORT}/my-pc-check
+    
+    // 📊 View all PCs:
+    //    curl http://localhost:${PORT}/all-pcs
+    
+    // 🔑 Add your PC to whitelist:
+    //    curl -X POST /whitelist/static \\
+    //      -H "Content-Type: application/json" \\
+    //      -d '{"ips": ["YOUR_IP_HERE"]}'
+    // ═══════════════════════════════════════════════════════
+    // `);
+
+
+     console.log(`
     ═══════════════════════════════════════════════════════
     🖥️  PC TRACKING & AUTHENTICATION SERVER
     ═══════════════════════════════════════════════════════
-    📍 URL:        http://0.0.0.0:${PORT}
-    
-    🔐 PROTECTED ENDPOINTS (Require Whitelist):
-       GET  /testresults  → View test results
-       GET  /data         → View all data
-       POST /data/realtimedata → Receive data stream
-    
-    📡 PC TRACKING ENDPOINTS:
-       GET  /all-pcs      → See every PC that has connected
-       GET  /pc/:ip       → See details for a specific PC
-       GET  /my-pc-check  → Check your own PC status
-       DELETE /all-pcs    → Clear PC access log
-    
-    🔑 WHITELIST MANAGEMENT:
-       GET    /whitelist           → View whitelist
-       POST   /whitelist/static    → Add static IPs
-       POST   /whitelist/network   → Add network ranges
-       DELETE /whitelist           → Remove from whitelist
-    
-    💡 Test from your PC:
-       curl http://localhost:${PORT}/my-pc-check
-    
-    📊 View all PCs:
-       curl http://localhost:${PORT}/all-pcs
-    
-    🔑 Add your PC to whitelist:
-       curl -X POST /whitelist/static \\
-         -H "Content-Type: application/json" \\
-         -d '{"ips": ["YOUR_IP_HERE"]}'
-    ═══════════════════════════════════════════════════════
-    `);
+    📍 URL:        http://0.0.0.0`) ;
+
+
 });
 
 // ============================================================
