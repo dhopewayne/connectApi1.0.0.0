@@ -432,8 +432,7 @@ const authenticateBranch = async (req, res, next) => {
         return res.status(403).json({
             success: false,
             error: 'Access Denied',
-            message: `Your IP (${clientIp}) is not whitelisted. Contact network administrator.`,
-            your_ip: clientIp,
+            message: `Contact network administrator for clarification.`,
             timestamp: new Date().toISOString()
         });
     }
