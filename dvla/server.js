@@ -112,6 +112,48 @@ function getClientIp(req) {
 }
 
 /**
+ * Get server IP addresses
+ */
+function getServerIps() {
+    const interfaces = os.networkInterfaces();
+    const ips = {
+        ipv4: [],
+        ipv6: []
+    };
+    
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            // Skip internal (loopback) addresses
+            if (iface.internal) continue;
+            
+            if (iface.family === 'IPv4') {
+                ips.ipv4.push({
+                    interface: name,
+                    address: iface.address,
+                    netmask: iface.netmask,
+                    mac: iface.mac
+                });
+            } else if (iface.family === 'IPv6') {
+                ips.ipv6.push({
+                    interface: name,
+                    address: iface.address,
+                    netmask: iface.netmask,
+                    mac: iface.mac
+                });
+            }
+        }
+    }
+    
+    // Also get localhost
+    ips.localhost = '127.0.0.1';
+    
+    // Get primary IP (first non-internal IPv4)
+    ips.primary = ips.ipv4.length > 0 ? ips.ipv4[0].address : '127.0.0.1';
+    
+    return ips;
+}
+
+/**
  * Check if IP is in a CIDR network range
  */
 function isIpInNetwork(ip, cidr) {
@@ -652,6 +694,35 @@ app.get('/my-pc-check', (req, res) => {
     });
 });
 
+/**
+ * Get your server IP address (the IP you're connecting from)
+ */
+app.get('/my-ip', (req, res) => {
+    const networkInfo = getClientNetworkInfo(req);
+    const clientIp = networkInfo.client_ip;
+    
+    // Get all possible IPs from headers and socket
+    const allIps = {
+        detected_ip: clientIp,
+        x_forwarded_for: req.headers['x-forwarded-for'] || null,
+        x_real_ip: req.headers['x-real-ip'] || null,
+        cf_connecting_ip: req.headers['cf-connecting-ip'] || null,
+        remote_address: req.socket?.remoteAddress || null,
+        socket_local_address: req.socket?.localAddress || null
+    };
+    
+    console.log(`\n🌐 IP QUERY from ${clientIp}`);
+    console.log(`   All detected IPs:`, allIps);
+    
+    res.json({
+        success: true,
+        message: "Your server IP address",
+        your_server_ip: clientIp,
+        all_detected_ips: allIps,
+        timestamp: new Date().toISOString()
+    });
+});
+
 // ============================================================
 // SECTION 11: PROTECTED ENDPOINTS
 // ============================================================
@@ -980,50 +1051,44 @@ process.on('SIGINT', () => {
 // ============================================================
 
 server.listen(PORT, '0.0.0.0', () => {
-    // console.log(`
-    // ═══════════════════════════════════════════════════════
-    // 🖥️  PC TRACKING & AUTHENTICATION SERVER
-    // ═══════════════════════════════════════════════════════
-    // 📍 URL:        http://0.0.0.0:${PORT}
-    
-    // 🔐 PROTECTED ENDPOINTS (Require Whitelist):
-    //    GET  /testresults  → View test results
-    //    GET  /data         → View all data
-    //    POST /data/realtimedata → Receive data stream
-    
-    // 📡 PC TRACKING ENDPOINTS:
-    //    GET  /all-pcs      → See every PC that has connected
-    //    GET  /pc/:ip       → See details for a specific PC
-    //    GET  /my-pc-check  → Check your own PC status
-    //    DELETE /all-pcs    → Clear PC access log
-    
-    // 🔑 WHITELIST MANAGEMENT:
-    //    GET    /whitelist           → View whitelist
-    //    POST   /whitelist/static    → Add static IPs
-    //    POST   /whitelist/network   → Add network ranges
-    //    DELETE /whitelist           → Remove from whitelist
-    
-    // 💡 Test from your PC:
-    //    curl http://localhost:${PORT}/my-pc-check
-    
-    // 📊 View all PCs:
-    //    curl http://localhost:${PORT}/all-pcs
-    
-    // 🔑 Add your PC to whitelist:
-    //    curl -X POST /whitelist/static \\
-    //      -H "Content-Type: application/json" \\
-    //      -d '{"ips": ["YOUR_IP_HERE"]}'
-    // ═══════════════════════════════════════════════════════
-    // `);
-
-
-     console.log(`
+    console.log(`
     ═══════════════════════════════════════════════════════
     🖥️  PC TRACKING & AUTHENTICATION SERVER
     ═══════════════════════════════════════════════════════
-    📍 URL:        http://0.0.0.0`) ;
-
-
+    📍 URL:        http://0.0.0.0:${PORT}
+    
+    🔐 PROTECTED ENDPOINTS (Require Whitelist):
+       GET  /testresults  → View test results
+       GET  /data         → View all data
+       POST /data/realtimedata → Receive data stream
+    
+    📡 PC TRACKING ENDPOINTS:
+       GET  /all-pcs      → See every PC that has connected
+       GET  /pc/:ip       → See details for a specific PC
+       GET  /my-pc-check  → Check your own PC status
+       DELETE /all-pcs    → Clear PC access log
+    
+    🔑 WHITELIST MANAGEMENT:
+       GET    /whitelist           → View whitelist
+       POST   /whitelist/static    → Add static IPs
+       POST   /whitelist/network   → Add network ranges
+       DELETE /whitelist           → Remove from whitelist
+    
+    🌐 IP QUERY:
+       GET    /my-ip       → Get your server IP address
+    
+    💡 Test from your PC:
+       curl http://localhost:${PORT}/my-ip
+    
+    📊 View all PCs:
+       curl http://localhost:${PORT}/all-pcs
+    
+    🔑 Add your PC to whitelist:
+       curl -X POST /whitelist/static \\
+         -H "Content-Type: application/json" \\
+         -d '{"ips": ["YOUR_IP_HERE"]}'
+    ═══════════════════════════════════════════════════════
+    `);
 });
 
 // ============================================================
