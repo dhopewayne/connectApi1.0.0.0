@@ -112,6 +112,55 @@ function getClientIp(req) {
 }
 
 /**
+ * Get server's unique MAC address (hardware address)
+ * This never changes for the server
+ */
+function getServerMacAddress() {
+    const interfaces = os.networkInterfaces();
+    
+    // First try to get MAC from a non-internal interface
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            // Skip internal (loopback) addresses
+            if (iface.internal) continue;
+            // Skip if no MAC address
+            if (!iface.mac || iface.mac === '00:00:00:00:00:00') continue;
+            
+            return {
+                mac: iface.mac,
+                interface: name,
+                family: iface.family,
+                address: iface.address
+            };
+        }
+    }
+    
+    // If no non-internal interface found, get from any interface
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            if (iface.mac && iface.mac !== '00:00:00:00:00:00') {
+                return {
+                    mac: iface.mac,
+                    interface: name,
+                    family: iface.family,
+                    address: iface.address,
+                    internal: iface.internal
+                };
+            }
+        }
+    }
+    
+    // Fallback: generate a unique ID based on hostname and timestamp
+    // This should only happen in very rare cases
+    return {
+        mac: 'UNKNOWN',
+        interface: 'unknown',
+        family: 'unknown',
+        address: 'unknown'
+    };
+}
+
+/**
  * Get server IP addresses
  */
 function getServerIps() {
@@ -695,6 +744,49 @@ app.get('/my-pc-check', (req, res) => {
 });
 
 /**
+ * Get your server's unique MAC address (this never changes)
+ */
+app.get('/server-mac', (req, res) => {
+    const macInfo = getServerMacAddress();
+    const serverIps = getServerIps();
+    
+    console.log(`\n🔑 SERVER MAC QUERY from ${req.clientIp || 'unknown'}`);
+    console.log(`   MAC Address: ${macInfo.mac}`);
+    console.log(`   Interface: ${macInfo.interface}`);
+    
+    // Generate a unique server ID based on MAC address
+    const serverId = macInfo.mac !== 'UNKNOWN' 
+        ? macInfo.mac.replace(/:/g, '').toUpperCase()
+        : 'UNKNOWN_SERVER';
+    
+    res.json({
+        success: true,
+        server: {
+            name: os.hostname(),
+            platform: os.platform(),
+            type: os.type(),
+            release: os.release()
+        },
+        unique_identifier: {
+            mac_address: macInfo.mac,
+            server_id: serverId,
+            interface: macInfo.interface,
+            is_permanent: true,
+            note: "MAC address is hardware-based and never changes"
+        },
+        network: {
+            primary_ip: serverIps.primary,
+            all_ipv4: serverIps.ipv4.map(ip => ({
+                interface: ip.interface,
+                address: ip.address,
+                mac: ip.mac
+            }))
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
  * Get your server IP address (the IP you're connecting from)
  */
 app.get('/my-ip', (req, res) => {
@@ -915,7 +1007,7 @@ app.get('/', (req, res) => {
         //     'GET /testresults': 'Get test results (WHITELIST PROTECTED)',
         //     'GET /data': 'Get data (WHITELIST PROTECTED)',
         //     'POST /data/realtimedata': 'Receive data stream (WHITELIST PROTECTED)',
-        //     'GET /history': 'View data history (WHITELIST PROTECTED)'
+        //     'GET /history': 'View data history (WHILIST PROTECTED)'
         // },
         // protected_endpoints: {
         //     '/testresults': 'Requires whitelisted IP',
@@ -1051,11 +1143,14 @@ process.on('SIGINT', () => {
 // ============================================================
 
 server.listen(PORT, '0.0.0.0', () => {
+    const macInfo = getServerMacAddress();
     console.log(`
     ═══════════════════════════════════════════════════════
     🖥️  PC TRACKING & AUTHENTICATION SERVER
     ═══════════════════════════════════════════════════════
     📍 URL:        http://0.0.0.0:${PORT}
+    🔑 Server MAC: ${macInfo.mac} (${macInfo.interface})
+    🆔 Server ID:  ${macInfo.mac !== 'UNKNOWN' ? macInfo.mac.replace(/:/g, '').toUpperCase() : 'UNKNOWN'}
     
     🔐 PROTECTED ENDPOINTS (Require Whitelist):
        GET  /testresults  → View test results
@@ -1076,9 +1171,11 @@ server.listen(PORT, '0.0.0.0', () => {
     
     🌐 IP QUERY:
        GET    /my-ip       → Get your server IP address
+       GET    /server-mac  → Get server's unique MAC address (never changes)
     
     💡 Test from your PC:
        curl http://localhost:${PORT}/my-ip
+       curl http://localhost:${PORT}/server-mac
     
     📊 View all PCs:
        curl http://localhost:${PORT}/all-pcs
