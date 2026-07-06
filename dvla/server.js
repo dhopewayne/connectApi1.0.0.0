@@ -913,11 +913,85 @@ app.get('/current-data', authenticateBranch, (req, res) => {
 // SECTION 11: PROTECTED ENDPOINTS
 // ============================================================
 
+// Update the remote server's /testresults endpoint to show ALL records
+
 /**
  * TEST RESULTS endpoint - Protected by whitelist
+ * GET /testresults - Returns ALL test results (Pass AND Fail)
+ * Optional query params: ?status=Pass|Fail|All
  */
 app.get('/testresults', authenticateBranch, (req, res) => {
     console.log(`📊 TEST RESULTS requested by ${req.clientInfo?.ip}`);
+    
+    const { status = 'All' } = req.query;
+    
+    if (!latestData.records || latestData.records.length === 0) {
+        return res.json({
+            success: true,
+            message: 'No data available yet',
+            data: {
+                records: [],
+                lastUpdate: null,
+                summary: {
+                    total: 0,
+                    pass: 0,
+                    fail: 0,
+                    pending: 0
+                }
+            },
+            timestamp: new Date().toISOString()
+        });
+    }
+    
+    let filteredRecords = latestData.records;
+    
+    // Filter by status if requested
+    if (status !== 'All') {
+        filteredRecords = latestData.records.filter(record => {
+            const result = record.PhysicalInspectionResults?.OverallResults || 'Pending';
+            return result.toLowerCase() === status.toLowerCase();
+        });
+    }
+    
+    // Calculate summary statistics
+    const summary = {
+        total: latestData.records.length,
+        pass: latestData.records.filter(r => {
+            const result = r.PhysicalInspectionResults?.OverallResults || 'Pending';
+            return result.toLowerCase() === 'pass';
+        }).length,
+        fail: latestData.records.filter(r => {
+            const result = r.PhysicalInspectionResults?.OverallResults || 'Pending';
+            return result.toLowerCase() === 'fail';
+        }).length,
+        pending: latestData.records.filter(r => {
+            const result = r.PhysicalInspectionResults?.OverallResults || 'Pending';
+            return result.toLowerCase() === 'pending';
+        }).length
+    };
+    
+    res.json({
+        success: true,
+        message: `Data retrieved successfully`,
+        filters: {
+            status: status,
+            available: ['All', 'Pass', 'Fail', 'Pending']
+        },
+        summary: summary,
+        data: {
+            records: filteredRecords,
+            count: filteredRecords.length,
+            lastUpdate: latestData.lastUpdate
+        },
+        timestamp: new Date().toISOString()
+    });
+}); 
+
+/**
+ * GET ALL TEST RESULTS - No filtering
+ */
+app.get('/all-testresults', authenticateBranch, (req, res) => {
+    console.log(`📊 ALL TEST RESULTS requested by ${req.clientInfo?.ip}`);
     
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
@@ -931,17 +1005,43 @@ app.get('/testresults', authenticateBranch, (req, res) => {
         });
     }
     
+    // Group by status
+    const passRecords = latestData.records.filter(r => {
+        const result = r.PhysicalInspectionResults?.OverallResults || 'Pending';
+        return result.toLowerCase() === 'pass';
+    });
+    
+    const failRecords = latestData.records.filter(r => {
+        const result = r.PhysicalInspectionResults?.OverallResults || 'Pending';
+        return result.toLowerCase() === 'fail';
+    });
+    
+    const pendingRecords = latestData.records.filter(r => {
+        const result = r.PhysicalInspectionResults?.OverallResults || 'Pending';
+        return result.toLowerCase() === 'pending';
+    });
+    
     res.json({
         success: true,
-        message: 'Data retrieved successfully',
-        data: {
-            records: latestData.records,
-            lastUpdate: latestData.lastUpdate,
-            count: latestData.records.length
+        message: 'All test results retrieved',
+        summary: {
+            total: latestData.records.length,
+            pass: passRecords.length,
+            fail: failRecords.length,
+            pending: pendingRecords.length
         },
+        data: {
+            all: latestData.records,
+            pass: passRecords,
+            fail: failRecords,
+            pending: pendingRecords
+        },
+        lastUpdate: latestData.lastUpdate,
         timestamp: new Date().toISOString()
     });
-});
+}); 
+
+
 
 /**
  * DATA endpoint - Protected by whitelist
@@ -1047,12 +1147,6 @@ app.post('/data/realtimedata', async (req, res) => {
         timestamp: new Date().toISOString()
     });
 });
-
-
-
-
-
-
 
 /**
  * HISTORY endpoint - Protected by whitelist
