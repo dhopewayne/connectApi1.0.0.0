@@ -1,8 +1,8 @@
 // ============================================================
-// REMOTE SERVER - PC TRACKING & AUTHENTICATION WITH DATA RECOVERY
+// REMOTE SERVER - PC TRACKING & AUTHENTICATION WITH WHITELIST
 // ============================================================
 // This server tracks all PCs that access it, maintains a whitelist,
-// and recovers data from local server on startup.
+// and protects endpoints by checking if the client IP is whitelisted.
 // ============================================================
 
 const express = require('express');
@@ -10,7 +10,6 @@ const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
 const os = require('os');
-const axios = require('axios');
 require('dotenv').config();
 
 // ============================================================
@@ -51,16 +50,10 @@ let dataHistory = [];
 const MAX_HISTORY = 50;
 
 // Track ALL PCs accessing the server (historical data)
-let pcAccessLog = new Map();
+let pcAccessLog = new Map(); // Key: client_ip, Value: PC info
 
 // Track currently active PCs (real-time connections)
-let activePCs = new Map();
-
-// Track blocked access attempts
-let blockedAttempts = new Map();
-
-// Track known local servers that can send data
-let knownLocalServers = new Map();
+let activePCs = new Map(); // Key: client_ip, Value: { connectionInfo, lastSeen, socketIds }
 
 // ============================================================
 // SECTION 4: WHITELIST CONFIGURATION
@@ -87,7 +80,13 @@ app.use((req, res, next) => {
 // SECTION 6: IP UTILITY FUNCTIONS
 // ============================================================
 
+/**
+ * Get client IP from various headers
+ * Handles proxies, Cloudflare, etc.
+ * This gets the IP of whoever is CONNECTING to this server
+ */
 function getClientIp(req) {
+    // Check various headers in order of trust
     const forwarded = req.headers['x-forwarded-for'];
     const xRealIp = req.headers['x-real-ip'];
     const cfConnectingIp = req.headers['cf-connecting-ip'];
@@ -96,6 +95,7 @@ function getClientIp(req) {
     let clientIp = null;
     let ipChain = [];
     
+    // Build IP chain from x-forwarded-for
     if (forwarded) {
         ipChain = forwarded.split(',').map(ip => ip.trim());
         clientIp = ipChain[0];
@@ -107,6 +107,7 @@ function getClientIp(req) {
         clientIp = socketIp;
     }
     
+    // Normalize localhost
     if (clientIp === '::1' || clientIp === '::ffff:127.0.0.1') {
         clientIp = '127.0.0.1';
     }
@@ -114,13 +115,22 @@ function getClientIp(req) {
     return { clientIp, ipChain, socketIp };
 }
 
+/**
+ * Get server's own IP addresses
+ * This gets the IP of THIS SERVER (not the client)
+ */
 function getServerIps() {
     const interfaces = os.networkInterfaces();
-    const ips = { ipv4: [], ipv6: [] };
+    const ips = {
+        ipv4: [],
+        ipv6: []
+    };
     
     for (const name of Object.keys(interfaces)) {
         for (const iface of interfaces[name]) {
+            // Skip internal (loopback) addresses
             if (iface.internal) continue;
+            
             if (iface.family === 'IPv4') {
                 ips.ipv4.push({
                     interface: name,
@@ -139,18 +149,30 @@ function getServerIps() {
         }
     }
     
+    // Also get localhost
     ips.localhost = '127.0.0.1';
+    
+    // Get primary IP (first non-internal IPv4)
     ips.primary = ips.ipv4.length > 0 ? ips.ipv4[0].address : '127.0.0.1';
+    
     return ips;
 }
 
+/**
+ * Get server's unique MAC address (hardware address)
+ * This never changes for the server
+ */
 function getServerMacAddress() {
     const interfaces = os.networkInterfaces();
     
+    // First try to get MAC from a non-internal interface
     for (const name of Object.keys(interfaces)) {
         for (const iface of interfaces[name]) {
+            // Skip internal (loopback) addresses
             if (iface.internal) continue;
+            // Skip if no MAC address
             if (!iface.mac || iface.mac === '00:00:00:00:00:00') continue;
+            
             return {
                 mac: iface.mac,
                 interface: name,
@@ -160,6 +182,7 @@ function getServerMacAddress() {
         }
     }
     
+    // If no non-internal interface found, get from any interface
     for (const name of Object.keys(interfaces)) {
         for (const iface of interfaces[name]) {
             if (iface.mac && iface.mac !== '00:00:00:00:00:00') {
@@ -174,6 +197,7 @@ function getServerMacAddress() {
         }
     }
     
+    // Fallback
     return {
         mac: 'UNKNOWN',
         interface: 'unknown',
@@ -182,6 +206,9 @@ function getServerMacAddress() {
     };
 }
 
+/**
+ * Check if IP is in a CIDR network range
+ */
 function isIpInNetwork(ip, cidr) {
     if (!ip || !cidr) return false;
     
@@ -203,14 +230,20 @@ function isIpInNetwork(ip, cidr) {
     return (ipNum & cidrMask) === (networkNum & cidrMask);
 }
 
+/**
+ * Check if an IP is whitelisted (static or network range)
+ */
 function isIpWhitelisted(ip) {
     if (!ip || ip === 'Unknown' || ip === '127.0.0.1') {
+        // Localhost is always allowed for testing
         if (ip === '127.0.0.1') return true;
         return false;
     }
     
+    // Check static IPs
     if (whitelistedStaticIps.includes(ip)) return true;
     
+    // Check network ranges
     if (whitelistedNetworks.length > 0) {
         for (const network of whitelistedNetworks) {
             if (isIpInNetwork(ip, network)) {
@@ -222,11 +255,15 @@ function isIpWhitelisted(ip) {
     return false;
 }
 
+/**
+ * Get full network info for a request
+ */
 function getClientNetworkInfo(req) {
     const { clientIp, ipChain, socketIp } = getClientIp(req);
     const serverIps = getServerIps();
     
     return {
+        // The client who is connecting
         client: {
             ip: clientIp || 'Unknown',
             ip_chain: ipChain || [],
@@ -239,6 +276,7 @@ function getClientNetworkInfo(req) {
             origin: req.headers['origin'] || null,
             is_whitelisted: isIpWhitelisted(clientIp)
         },
+        // The server they are connecting to
         server: {
             primary_ip: serverIps.primary,
             all_ipv4: serverIps.ipv4,
@@ -253,18 +291,24 @@ function getClientNetworkInfo(req) {
 // SECTION 7: TRACKING MIDDLEWARE
 // ============================================================
 
+/**
+ * Middleware to track all PCs/servers accessing this server
+ */
 app.use((req, res, next) => {
     const networkInfo = getClientNetworkInfo(req);
     const clientIp = networkInfo.client.ip;
     const isWhitelisted = networkInfo.client.is_whitelisted;
     const isLocal = networkInfo.connection_type === 'LOCAL';
     
+    // Store in request for later use
     req.clientInfo = networkInfo.client;
     req.serverInfo = networkInfo.server;
     req.connectionType = networkInfo.connection_type;
     
     if (clientIp && clientIp !== 'Unknown' && clientIp !== '127.0.0.1') {
+        // Update historical log
         if (!pcAccessLog.has(clientIp)) {
+            // New PC/Server detected
             pcAccessLog.set(clientIp, {
                 first_seen: new Date().toISOString(),
                 last_seen: new Date().toISOString(),
@@ -280,9 +324,10 @@ app.use((req, res, next) => {
                 total_connections: 0,
                 connection_type: networkInfo.connection_type
             });
-            console.log(`🆕 NEW ${isLocal ? 'LOCAL' : 'REMOTE'} CLIENT DETECTED: ${clientIp}`);
+            console.log(`🆕 NEW ${isLocal ? 'LOCAL' : 'REMOTE'} CLIENT DETECTED: ${clientIp} (Whitelisted: ${isWhitelisted})`);
         }
         
+        // Update existing PC record
         const pcRecord = pcAccessLog.get(clientIp);
         pcRecord.last_seen = new Date().toISOString();
         pcRecord.total_requests += 1;
@@ -294,6 +339,7 @@ app.use((req, res, next) => {
         pcRecord.is_local = isLocal;
         pcRecord.connection_type = networkInfo.connection_type;
         
+        // Track endpoint accessed
         if (req.originalUrl) {
             const endpoint = req.originalUrl.split('?')[0];
             if (!pcRecord.endpoints_accessed.includes(endpoint)) {
@@ -301,6 +347,7 @@ app.use((req, res, next) => {
             }
         }
         
+        // Store request history (keep last 20)
         pcRecord.request_history.push({
             timestamp: new Date().toISOString(),
             method: req.method,
@@ -313,7 +360,9 @@ app.use((req, res, next) => {
         
         pcAccessLog.set(clientIp, pcRecord);
         
+        // Update active PCs
         if (!activePCs.has(clientIp)) {
+            // New active connection
             const socketId = req.socket?.id || 'http';
             activePCs.set(clientIp, {
                 connected_at: new Date().toISOString(),
@@ -327,9 +376,12 @@ app.use((req, res, next) => {
                 requests_in_session: 1,
                 server_info: networkInfo.server
             });
-            console.log(`✅ ${isLocal ? 'LOCAL' : 'REMOTE'} CLIENT CONNECTED: ${clientIp}`);
+            console.log(`✅ ${isLocal ? 'LOCAL' : 'REMOTE'} CLIENT CONNECTED: ${clientIp} (Active sessions: ${activePCs.size})`);
+            
+            // Broadcast active PCs update
             broadcastActivePCs();
         } else {
+            // Update existing active connection
             const activeRecord = activePCs.get(clientIp);
             activeRecord.last_seen = new Date().toISOString();
             activeRecord.requests_in_session += 1;
@@ -340,6 +392,7 @@ app.use((req, res, next) => {
             activeRecord.connection_type = networkInfo.connection_type;
             activeRecord.server_info = networkInfo.server;
             
+            // Add socket ID if not present
             const socketId = req.socket?.id || 'http';
             if (!activeRecord.socket_ids.includes(socketId)) {
                 activeRecord.socket_ids.push(socketId);
@@ -356,140 +409,43 @@ app.use((req, res, next) => {
 // SECTION 8: AUTHENTICATION MIDDLEWARE
 // ============================================================
 
+/**
+ * Middleware to authenticate and check whitelist
+ * Returns 403 if IP is not whitelisted
+ */
 const authenticateBranch = async (req, res, next) => {
     const clientIp = req.clientInfo?.ip || 'Unknown';
     const isWhitelisted = req.clientInfo?.is_whitelisted || false;
-    const connectionType = req.connectionType || 'UNKNOWN';
-    const endpoint = req.originalUrl;
     
+    // Check if whitelisted
     if (!isWhitelisted) {
-        console.log(`❌ ACCESS DENIED - IP: ${clientIp} (${connectionType}) attempted to access ${endpoint}`);
+        console.log(`❌ ENDPOINT ACCESS DENIED for ${clientIp}`);
         
-        if (!blockedAttempts.has(clientIp)) {
-            blockedAttempts.set(clientIp, {
-                attempts: 0,
-                first_blocked: new Date().toISOString(),
-                last_blocked: new Date().toISOString(),
-                endpoints: []
-            });
-        }
-        
-        const blockedRecord = blockedAttempts.get(clientIp);
-        blockedRecord.attempts += 1;
-        blockedRecord.last_blocked = new Date().toISOString();
-        if (!blockedRecord.endpoints.includes(endpoint)) {
-            blockedRecord.endpoints.push(endpoint);
-        }
-        blockedAttempts.set(clientIp, blockedRecord);
-        
+        // Update PC record with failed attempt
         if (pcAccessLog.has(clientIp)) {
             const pcRecord = pcAccessLog.get(clientIp);
             pcRecord.last_denied = new Date().toISOString();
             pcRecord.denied_count = (pcRecord.denied_count || 0) + 1;
-            pcRecord.denied_endpoints = pcRecord.denied_endpoints || [];
-            if (!pcRecord.denied_endpoints.includes(endpoint)) {
-                pcRecord.denied_endpoints.push(endpoint);
-            }
             pcAccessLog.set(clientIp, pcRecord);
         }
         
         return res.status(403).json({
             success: false,
-            error: 'Access Denied - IP Not Whitelisted',
-            message: `Your IP address (${clientIp}) is not whitelisted.`,
-            details: {
-                your_ip: clientIp,
-                connection_type: connectionType,
-                endpoint_attempted: endpoint,
-                timestamp: new Date().toISOString(),
-                attempt_count: blockedRecord.attempts
-            },
-            action_required: 'Contact Network Administrator or IT Office',
-            how_to_fix: {
-                contact: 'Network Administrator / IT Department',
-                provide: `Your IP address: ${clientIp}`,
-                whitelist_endpoint: 'POST /whitelist/static'
-            },
+            error: 'Access Denied',
+            message: `Contact network administrator for clarification.`,
             timestamp: new Date().toISOString()
         });
     }
-    
-    console.log(`✅ ACCESS GRANTED - IP: ${clientIp} (${connectionType}) accessing ${endpoint}`);
     next();
 };
- 
 
-
-// Add to remote server
-
-/**
- * Register local server
- */
-app.post('/register-local-server', (req, res) => {
-    const { serverUrl, secret } = req.body;
-    
-    if (!serverUrl) {
-        return res.status(400).json({
-            success: false,
-            error: 'serverUrl is required'
-        });
-    }
-    
-    // Store the registration
-    knownLocalServers.set(serverUrl, {
-        lastSeen: new Date().toISOString(),
-        status: 'registered',
-        secret: secret || null,
-        registeredAt: new Date().toISOString()
-    });
-    
-    console.log(`📝 Local server registered: ${serverUrl}`);
-    
-    res.json({
-        success: true,
-        message: 'Local server registered',
-        serverUrl: serverUrl,
-        timestamp: new Date().toISOString()
-    });
-});
-
-/**
- * Get all registered local servers
- */
-app.get('/local-servers', (req, res) => {
-    const servers = [];
-    for (const [url, info] of knownLocalServers) {
-        servers.push({ url, ...info });
-    }
-    
-    res.json({
-        success: true,
-        servers: servers,
-        count: servers.length,
-        timestamp: new Date().toISOString()
-    });
-});
-
-/**
- * Get current data status
- */
-app.get('/data-status', (req, res) => {
-    res.json({
-        success: true,
-        data: {
-            recordCount: latestData.records?.length || 0,
-            lastUpdate: latestData.lastUpdate,
-            source: latestData.source,
-            historyCount: dataHistory.length,
-            activeClients: activePCs.size            
-        },
-        timestamp: new Date().toISOString()
-    });
-});
 // ============================================================
 // SECTION 9: WHITELIST MANAGEMENT ENDPOINTS
 // ============================================================
 
+/**
+ * View current whitelist
+ */
 app.get('/whitelist', (req, res) => {
     res.json({
         success: true,
@@ -506,27 +462,17 @@ app.get('/whitelist', (req, res) => {
     });
 });
 
-app.get('/blocked-attempts', (req, res) => {
-    const blockedList = [];
-    for (const [ip, info] of blockedAttempts) {
-        blockedList.push({ ip, ...info });
-    }
-    blockedList.sort((a, b) => new Date(b.last_blocked) - new Date(a.last_blocked));
-    
-    res.json({
-        success: true,
-        total_blocked_ips: blockedList.length,
-        blocked_attempts: blockedList,
-        timestamp: new Date().toISOString()
-    });
-});
-
+/**
+ * Add static IPs to whitelist
+ */
 app.post('/whitelist/static', (req, res) => {
     let ipsToAdd = [];
     
     if (req.body.ipData && Array.isArray(req.body.ipData)) {
-        ipsToAdd = req.body.ipData.map(item => item.ipAddress || item.ip).filter(Boolean);
-        console.log(`📥 Received IP data: ${ipsToAdd.length} IPs`);
+        ipsToAdd = req.body.ipData
+            .map(item => item.ipAddress || item.ip)
+            .filter(Boolean);
+        console.log(`📥 Received IP data from local server: ${ipsToAdd.length} IPs`);
     } else if (req.body.ips) {
         const ips = Array.isArray(req.body.ips) ? req.body.ips : [req.body.ips];
         ipsToAdd = ips.map(ip => ip.trim()).filter(Boolean);
@@ -547,19 +493,17 @@ app.post('/whitelist/static', (req, res) => {
         if (!whitelistedStaticIps.includes(ip)) {
             whitelistedStaticIps.push(ip);
             added.push(ip);
+            // Update PC record if exists
             if (pcAccessLog.has(ip)) {
                 const record = pcAccessLog.get(ip);
                 record.is_whitelisted = true;
                 pcAccessLog.set(ip, record);
             }
+            // Update active PC record
             if (activePCs.has(ip)) {
                 const activeRecord = activePCs.get(ip);
                 activeRecord.is_whitelisted = true;
                 activePCs.set(ip, activeRecord);
-            }
-            if (blockedAttempts.has(ip)) {
-                blockedAttempts.delete(ip);
-                console.log(`✅ IP ${ip} removed from blocked list`);
             }
         } else {
             alreadyExist.push(ip);
@@ -579,6 +523,9 @@ app.post('/whitelist/static', (req, res) => {
     });
 });
 
+/**
+ * Add network ranges to whitelist
+ */
 app.post('/whitelist/network', (req, res) => {
     const { networks } = req.body;
 
@@ -601,22 +548,21 @@ app.post('/whitelist/network', (req, res) => {
         if (!network.includes('/')) {
             return res.status(400).json({
                 success: false,
-                error: `Invalid network format: ${network}. Use CIDR format`
+                error: `Invalid network format: ${network}. Use CIDR format (e.g., 192.168.1.0/24)`
             });
         }
         
         if (!whitelistedNetworks.includes(network)) {
             whitelistedNetworks.push(network);
             added.push(network);
+            // Update all PC records that are in this network
             for (const [ip, record] of pcAccessLog) {
                 if (isIpInNetwork(ip, network)) {
                     record.is_whitelisted = true;
                     pcAccessLog.set(ip, record);
-                    if (blockedAttempts.has(ip)) {
-                        blockedAttempts.delete(ip);
-                    }
                 }
             }
+            // Update active PCs
             for (const [ip, record] of activePCs) {
                 if (isIpInNetwork(ip, network)) {
                     record.is_whitelisted = true;
@@ -641,6 +587,9 @@ app.post('/whitelist/network', (req, res) => {
     });
 });
 
+/**
+ * Remove from whitelist
+ */
 app.delete('/whitelist', (req, res) => {
     const { type, value } = req.body;
 
@@ -708,218 +657,291 @@ app.delete('/whitelist', (req, res) => {
 });
 
 // ============================================================
-// SECTION 10: DATA RECOVERY ENDPOINTS
+// SECTION 10: PC TRACKING ENDPOINTS
 // ============================================================
 
 /**
- * Register a local server that can send data
+ * Show ALL clients that have EVER accessed this server (historical)
  */
-app.post('/register-local-server', (req, res) => {
-    const { serverUrl, secret } = req.body;
+app.get('/all-pcs-history', (req, res) => {
+    const allPCs = [];
+    let whitelistedCount = 0;
+    let totalRequests = 0;
+    let deniedCount = 0;
+    let localCount = 0;
+    let remoteCount = 0;
     
-    if (!serverUrl) {
-        return res.status(400).json({
+    for (const [ip, info] of pcAccessLog) {
+        allPCs.push({
+            ip: ip,
+            ...info
+        });
+        if (info.is_whitelisted) whitelistedCount++;
+        if (info.is_local) localCount++;
+        else remoteCount++;
+        totalRequests += info.total_requests;
+        deniedCount += (info.denied_count || 0);
+    }
+    
+    allPCs.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
+    
+    res.json({
+        success: true,
+        type: 'historical',
+        summary: {
+            total_clients_ever: allPCs.length,
+            whitelisted_clients: whitelistedCount,
+            unwhitelisted_clients: allPCs.length - whitelistedCount,
+            local_connections: localCount,
+            remote_connections: remoteCount,
+            total_requests: totalRequests,
+            total_denied: deniedCount,
+            last_updated: new Date().toISOString()
+        },
+        clients: allPCs,
+        whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
+ * Show CURRENTLY ACTIVE clients (real-time)
+ */
+app.get('/all-pcs', (req, res) => {
+    const activePCsList = [];
+    let whitelistedCount = 0;
+    let localCount = 0;
+    let remoteCount = 0;
+    
+    for (const [ip, info] of activePCs) {
+        activePCsList.push({
+            ip: ip,
+            ...info
+        });
+        if (info.is_whitelisted) whitelistedCount++;
+        if (info.is_local) localCount++;
+        else remoteCount++;
+    }
+    
+    activePCsList.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
+    
+    res.json({
+        success: true,
+        type: 'real-time',
+        summary: {
+            active_clients: activePCs.size,
+            whitelisted_active: whitelistedCount,
+            unwhitelisted_active: activePCs.size - whitelistedCount,
+            local_active: localCount,
+            remote_active: remoteCount,
+            last_updated: new Date().toISOString()
+        },
+        active_clients: activePCsList,
+        whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks
+        },
+        server_info: {
+            primary_ip: getServerIps().primary,
+            port: PORT,
+            hostname: os.hostname()
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
+ * Show details for a specific client
+ */
+app.get('/pc/:ip', (req, res) => {
+    const ip = req.params.ip;
+    
+    if (!pcAccessLog.has(ip)) {
+        return res.status(404).json({
             success: false,
-            error: 'serverUrl is required'
+            error: 'Client not found',
+            message: `No client with IP ${ip} has accessed this server`
         });
     }
     
-    knownLocalServers.set(serverUrl, {
-        lastSeen: new Date().toISOString(),
-        status: 'registered',
-        secret: secret || null
-    });
-    
-    console.log(`📝 Local server registered: ${serverUrl}`);
+    const pcInfo = pcAccessLog.get(ip);
+    const isActive = activePCs.has(ip);
+    const activeInfo = isActive ? activePCs.get(ip) : null;
     
     res.json({
         success: true,
-        message: 'Local server registered',
-        serverUrl: serverUrl,
+        client: {
+            ip: ip,
+            ...pcInfo,
+            currently_active: isActive,
+            active_session: activeInfo ? {
+                connected_at: activeInfo.connected_at,
+                last_seen: activeInfo.last_seen,
+                requests_in_session: activeInfo.requests_in_session,
+                socket_ids: activeInfo.socket_ids,
+                server_connected_to: activeInfo.server_info
+            } : null
+        },
         timestamp: new Date().toISOString()
     });
 });
 
 /**
- * Get all registered local servers
+ * Clear PC access log (historical only)
  */
-app.get('/local-servers', (req, res) => {
-    const servers = [];
-    for (const [url, info] of knownLocalServers) {
-        servers.push({ url, ...info });
-    }
+app.delete('/all-pcs-history', (req, res) => {
+    const count = pcAccessLog.size;
+    pcAccessLog.clear();
+    
+    console.log(`🗑️ Client history cleared (${count} clients removed from history)`);
     
     res.json({
         success: true,
-        servers: servers,
-        count: servers.length,
+        message: `Cleared client history (${count} clients)`,
+        removed_count: count,
+        active_clients_remain: activePCs.size,
         timestamp: new Date().toISOString()
     });
 });
 
 /**
- * REQUEST DATA RECOVERY FROM LOCAL SERVER
- * This tells the local server to resend all its data
+ * Remove a specific client from active list (force disconnect)
  */
-app.post('/recover-data/:serverUrl', async (req, res) => {
-    const serverUrl = decodeURIComponent(req.params.serverUrl);
-    const secret = req.headers['x-source-secret'] || process.env.REMOTE_SECRET;
+app.delete('/pc/:ip/disconnect', (req, res) => {
+    const ip = req.params.ip;
     
-    console.log(`🔄 Requesting data recovery from: ${serverUrl}`);
-    
-    try {
-        if (!knownLocalServers.has(serverUrl)) {
-            return res.status(404).json({
-                success: false,
-                error: 'Server not registered. Register first using /register-local-server'
-            });
-        }
-        
-        // Call the local server's recovery endpoint
-        const response = await axios.post(`${serverUrl}/recovery/full`, {
-            secret: secret
-        }, {
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Source-Secret': secret
-            },
-            timeout: 30000
-        });
-        
-        if (response.data && response.data.success) {
-            console.log(`✅ Data recovery from ${serverUrl} successful`);
-            
-            const serverInfo = knownLocalServers.get(serverUrl);
-            serverInfo.lastRecovery = new Date().toISOString();
-            serverInfo.lastStatus = 'success';
-            knownLocalServers.set(serverUrl, serverInfo);
-            
-            return res.json({
-                success: true,
-                message: 'Data recovery successful',
-                recovered: response.data,
-                serverUrl: serverUrl,
-                timestamp: new Date().toISOString()
-            });
-        } else {
-            return res.json({
-                success: false,
-                error: 'Recovery failed',
-                message: response.data?.message || 'Unknown error',
-                serverUrl: serverUrl,
-                timestamp: new Date().toISOString()
-            });
-        }
-        
-    } catch (err) {
-        console.error(`❌ Error recovering from ${serverUrl}:`, err.message);
-        
-        if (knownLocalServers.has(serverUrl)) {
-            const serverInfo = knownLocalServers.get(serverUrl);
-            serverInfo.lastRecovery = new Date().toISOString();
-            serverInfo.lastStatus = 'failed';
-            serverInfo.lastError = err.message;
-            knownLocalServers.set(serverUrl, serverInfo);
-        }
-        
-        return res.status(500).json({
+    if (!activePCs.has(ip)) {
+        return res.status(404).json({
             success: false,
-            error: 'Recovery failed',
-            message: err.message,
-            serverUrl: serverUrl,
-            timestamp: new Date().toISOString()
+            error: 'Client not active',
+            message: `No active client with IP ${ip}`
         });
     }
-});
-
-/**
- * AUTO-RECOVER from ALL registered local servers on startup
- */
-app.post('/recover-all', async (req, res) => {
-    console.log('🔄 Starting full recovery from all registered local servers...');
     
-    const results = [];
-    let totalRecovered = 0;
-    let totalRecords = 0;
+    const activeInfo = activePCs.get(ip);
+    activePCs.delete(ip);
     
-    for (const [serverUrl, info] of knownLocalServers) {
-        console.log(`📤 Recovering from ${serverUrl}...`);
-        
-        try {
-            const response = await axios.post(`${serverUrl}/recovery/full`, {}, {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Source-Secret': process.env.REMOTE_SECRET
-                },
-                timeout: 30000
-            });
-            
-            if (response.data && response.data.success) {
-                results.push({
-                    serverUrl: serverUrl,
-                    success: true,
-                    data: response.data
-                });
-                totalRecovered++;
-                
-                // Store the recovered data
-                if (response.data.result && response.data.result.recoveryResult) {
-                    const recoveredCount = response.data.result.recoveryResult.recovered || 0;
-                    totalRecords += recoveredCount;
-                    console.log(`✅ Recovered ${recoveredCount} records from ${serverUrl}`);
-                }
-            } else {
-                results.push({
-                    serverUrl: serverUrl,
-                    success: false,
-                    error: response.data?.message || 'Unknown error'
-                });
-                console.log(`⚠️ Failed to recover from ${serverUrl}`);
-            }
-        } catch (err) {
-            results.push({
-                serverUrl: serverUrl,
-                success: false,
-                error: err.message
-            });
-            console.log(`❌ Error recovering from ${serverUrl}: ${err.message}`);
-        }
-    }
+    console.log(`🔌 CLIENT DISCONNECTED (forced): ${ip} (${activeInfo.is_local ? 'LOCAL' : 'REMOTE'})`);
+    
+    broadcastActivePCs();
     
     res.json({
         success: true,
-        message: `Recovered from ${totalRecovered}/${knownLocalServers.size} servers`,
-        results: results,
-        total_recovered: totalRecovered,
-        total_records: totalRecords,
-        total_servers: knownLocalServers.size,
+        message: `Client ${ip} disconnected`,
+        client_type: activeInfo.is_local ? 'LOCAL' : 'REMOTE',
+        disconnected_at: new Date().toISOString(),
         timestamp: new Date().toISOString()
     });
 });
 
 /**
- * GET current data (for debugging)
+ * Check your own client info and connection status
  */
-app.get('/current-data', authenticateBranch, (req, res) => {
+app.get('/my-pc-check', (req, res) => {
+    const clientInfo = req.clientInfo;
+    const serverInfo = req.serverInfo;
+    const connectionType = req.connectionType;
+    const clientIp = clientInfo?.ip || 'Unknown';
+    const isWhitelisted = clientInfo?.is_whitelisted || false;
+    const isActive = activePCs.has(clientIp);
+    
+    console.log(`\n🖥️ CLIENT CHECK from ${clientIp} (${connectionType})`);
+    
+    const pcHistory = pcAccessLog.get(clientIp);
+    const activeInfo = activePCs.get(clientIp);
+    
     res.json({
         success: true,
-        data: latestData,
-        history: dataHistory,
+        your_info: {
+            client_ip: clientIp,
+            connection_type: connectionType,
+            is_local: connectionType === 'LOCAL',
+            is_whitelisted: isWhitelisted,
+            is_active: isActive,
+            active_since: activeInfo?.connected_at || null,
+            last_seen: activeInfo?.last_seen || null,
+            total_requests: pcHistory?.total_requests || 0,
+            first_seen: pcHistory?.first_seen || null,
+            denied_count: pcHistory?.denied_count || 0,
+            user_agent: clientInfo?.user_agent || 'Unknown'
+        },
+        server_you_are_connecting_to: {
+            primary_ip: serverInfo?.primary_ip || 'Unknown',
+            port: serverInfo?.port || PORT,
+            hostname: serverInfo?.hostname || os.hostname(),
+            all_ips: serverInfo?.all_ipv4 || []
+        },
+        whitelist_status: {
+            status: isWhitelisted ? '✅ AUTHORIZED' : '❌ NOT AUTHORIZED',
+            message: isWhitelisted 
+                ? `Your client (${clientIp}) is authorized to access protected endpoints`
+                : `Your client (${clientIp || 'unknown'}) is NOT authorized to access protected endpoints`
+        },
+        server_whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks
+        },
         timestamp: new Date().toISOString()
     });
 });
+
+/**
+ * Get your server's unique MAC address
+ */
+app.get('/server-mac', (req, res) => {
+    const macInfo = getServerMacAddress();
+    const serverIps = getServerIps();
+    
+    console.log(`\n🔑 SERVER MAC QUERY from ${req.clientInfo?.ip || 'unknown'}`);
+    console.log(`   MAC Address: ${macInfo.mac}`);
+    console.log(`   Interface: ${macInfo.interface}`);
+    
+    const serverId = macInfo.mac !== 'UNKNOWN' 
+        ? macInfo.mac.replace(/:/g, '').toUpperCase()
+        : 'UNKNOWN_SERVER';
+    
+    res.json({
+        success: true,
+        server: {
+            name: os.hostname(),
+            platform: os.platform(),
+            type: os.type(),
+            release: os.release()
+        },
+        unique_identifier: {
+            mac_address: macInfo.mac,
+            server_id: serverId,
+            interface: macInfo.interface,
+            is_permanent: true,
+            note: "MAC address is hardware-based and never changes"
+        },
+        network: {
+            primary_ip: serverIps.primary,
+            all_ipv4: serverIps.ipv4.map(ip => ({
+                interface: ip.interface,
+                address: ip.address,
+                mac: ip.mac
+            }))
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
+ * Get your own server IP address (the IP you're connecting from)
+ */
 
 // ============================================================
 // SECTION 11: PROTECTED ENDPOINTS
 // ============================================================
 
-// Update the remote server's /testresults endpoint to show ALL records
-
 /**
  * TEST RESULTS endpoint - Protected by whitelist
- * GET /testresults - Returns ALL test results (Pass AND Fail)
- * Optional query params: ?status=Pass|Fail|All
  */
+
 app.get('/testresults', authenticateBranch, (req, res) => {
     console.log(`📊 TEST RESULTS requested by ${req.clientInfo?.ip}`);
     
@@ -985,7 +1007,11 @@ app.get('/testresults', authenticateBranch, (req, res) => {
         },
         timestamp: new Date().toISOString()
     });
-}); 
+});
+
+
+
+// Add to remote server - Get all records including failures
 
 /**
  * GET ALL TEST RESULTS - No filtering
@@ -1039,9 +1065,7 @@ app.get('/all-testresults', authenticateBranch, (req, res) => {
         lastUpdate: latestData.lastUpdate,
         timestamp: new Date().toISOString()
     });
-}); 
-
-
+});
 
 /**
  * DATA endpoint - Protected by whitelist
@@ -1050,40 +1074,31 @@ app.get('/data', authenticateBranch, (req, res) => {
     res.json({
         success: true,
         message: 'Protected data endpoint',
-        records: latestData.records || [],
-        count: latestData.records?.length || 0,
-        lastUpdate: latestData.lastUpdate,
-        source: latestData.source,
-        table: latestData.table,
+        records: latestData.records || [],       
         timestamp: new Date().toISOString()
     });
 });
 
 /**
- * DATA endpoint - Receive data from local PC
- * POST /data/realtimedata
- * This is where the local server sends data
+ * DATA endpoint - Protected by whitelist
+ * POST /data/realtimedata - Receive data from local PC
  */
-// Add to remote server - This endpoint doesn't require whitelist for local servers
-// Special endpoint for local servers to send data (bypasses whitelist check)
-
 app.post('/data/realtimedata', async (req, res) => {
-    const { timestamp, records, count, source, table, plateNumber, isRefresh } = req.body;
+    const { timestamp, records, count, source, table } = req.body;
     const sourceSecret = req.headers['x-source-secret'];
     const expectedSecret = process.env.REMOTE_SECRET;
 
     console.log(`\n📡 STREAM RECEIVED at ${new Date().toISOString()}`);
+    console.log(`   From IP: ${req.clientInfo?.ip}`);
+    console.log(`   Connection: ${req.connectionType}`);
     console.log(`   Records: ${count || (records && records.length) || 0}`);
-    console.log(`   Source:  ${source || 'local_pc'}`);
-    console.log(`   Plate:   ${plateNumber || 'N/A'}`);
 
-    // Check secret
     if (expectedSecret && sourceSecret !== expectedSecret) {
         console.log(`❌ Invalid secret — rejecting data`);
         return res.status(401).json({
             success: false,
             error: 'Invalid secret',
-            your_ip: req.ip
+            your_ip: req.clientInfo?.ip
         });
     }
 
@@ -1091,42 +1106,31 @@ app.post('/data/realtimedata', async (req, res) => {
         console.log(`⚠️ No records in stream`);
         return res.json({ 
             success: true, 
-            message: 'No data to process'
+            message: 'No data to process',
+            your_ip: req.clientInfo?.ip
         });
     }
 
-    // Store the data
     latestData = {
         records: records,
         lastUpdate: new Date().toISOString(),
-        source: source || 'local_pc',
-        table: table || 'unknown',
-        count: records.length,
         receivedAt: timestamp || new Date().toISOString()
     };
 
-    // Add to history
     dataHistory.unshift({
         timestamp: new Date().toISOString(),
         recordCount: records.length,
         source: source || 'local_pc',
-        from_ip: req.ip || 'unknown',
-        plateNumber: plateNumber || 'N/A',
-        isRefresh: isRefresh || false
+        from_ip: req.clientInfo?.ip,
+        connection_type: req.connectionType
     });
 
     if (dataHistory.length > MAX_HISTORY) dataHistory.pop();
 
-    console.log(`✅ Data stored: ${records.length} records`);
-
-    // Broadcast to connected branches
     const broadcastPayload = {
         type: 'live_update',
         timestamp: new Date().toISOString(),
-        records: records,
-        count: records.length,
-        source: source || 'local_pc',
-        plateNumber: plateNumber || null
+        records: records
     };
 
     let branchesNotified = 0;
@@ -1148,9 +1152,10 @@ app.post('/data/realtimedata', async (req, res) => {
     });
 });
 
-/**
- * HISTORY endpoint - Protected by whitelist
- */
+// ============================================================
+// SECTION 12: DATA HISTORY ENDPOINT
+// ============================================================
+
 app.get('/history', authenticateBranch, (req, res) => {
     const { limit = 20 } = req.query;
     
@@ -1163,90 +1168,16 @@ app.get('/history', authenticateBranch, (req, res) => {
 });
 
 // ============================================================
-// SECTION 12: PC TRACKING ENDPOINTS
-// ============================================================
-
-app.get('/all-pcs', (req, res) => {
-    const activePCsList = [];
-    let whitelistedCount = 0;
-    let localCount = 0;
-    let remoteCount = 0;
-    
-    for (const [ip, info] of activePCs) {
-        activePCsList.push({ ip, ...info });
-        if (info.is_whitelisted) whitelistedCount++;
-        if (info.is_local) localCount++;
-        else remoteCount++;
-    }
-    
-    activePCsList.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
-    
-    res.json({
-        success: true,
-        type: 'real-time',
-        summary: {
-            active_clients: activePCs.size,
-            whitelisted_active: whitelistedCount,
-            unwhitelisted_active: activePCs.size - whitelistedCount,
-            local_active: localCount,
-            remote_active: remoteCount,
-            last_updated: new Date().toISOString()
-        },
-        active_clients: activePCsList,
-        server_info: {
-            primary_ip: getServerIps().primary,
-            port: PORT,
-            hostname: os.hostname()
-        },
-        timestamp: new Date().toISOString()
-    });
-});
-
-app.get('/all-pcs-history', (req, res) => {
-    const allPCs = [];
-    let whitelistedCount = 0;
-    let totalRequests = 0;
-    let deniedCount = 0;
-    let localCount = 0;
-    let remoteCount = 0;
-    
-    for (const [ip, info] of pcAccessLog) {
-        allPCs.push({ ip, ...info });
-        if (info.is_whitelisted) whitelistedCount++;
-        if (info.is_local) localCount++;
-        else remoteCount++;
-        totalRequests += info.total_requests;
-        deniedCount += (info.denied_count || 0);
-    }
-    
-    allPCs.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
-    
-    res.json({
-        success: true,
-        type: 'historical',
-        summary: {
-            total_clients_ever: allPCs.length,
-            whitelisted_clients: whitelistedCount,
-            unwhitelisted_clients: allPCs.length - whitelistedCount,
-            local_connections: localCount,
-            remote_connections: remoteCount,
-            total_requests: totalRequests,
-            total_denied: deniedCount,
-            last_updated: new Date().toISOString()
-        },
-        clients: allPCs,
-        timestamp: new Date().toISOString()
-    });
-});
-
-// ============================================================
 // SECTION 13: BROADCAST FUNCTIONS
 // ============================================================
 
 function broadcastActivePCs() {
     const activePCsList = [];
     for (const [ip, info] of activePCs) {
-        activePCsList.push({ ip, ...info });
+        activePCsList.push({
+            ip: ip,
+            ...info
+        });
     }
     
     const payload = {
@@ -1266,6 +1197,41 @@ function broadcastActivePCs() {
         }
     }
 }
+ 
+
+
+app.get('/my-ip', (req, res) => {
+    const clientInfo = req.clientInfo;
+    const serverInfo = req.serverInfo;
+    const connectionType = req.connectionType;
+    const clientIp = clientInfo?.ip || 'Unknown';
+    
+    const allIps = {
+        detected_ip: clientIp,
+        x_forwarded_for: req.headers['x-forwarded-for'] || null,
+        x_real_ip: req.headers['x-real-ip'] || null,
+        cf_connecting_ip: req.headers['cf-connecting-ip'] || null,
+        remote_address: req.socket?.remoteAddress || null,
+        socket_local_address: req.socket?.localAddress || null
+    };
+    
+    console.log(`\n🌐 IP QUERY from ${clientIp} (${connectionType})`);
+    
+    res.json({
+        success: true,
+        message: "Your client IP address",
+        your_client_ip: clientIp,
+        connection_type: connectionType,
+        is_local: connectionType === 'LOCAL',
+        all_detected_ips: allIps,
+        server_info: {
+            primary_ip: serverInfo?.primary_ip || 'Unknown',
+            port: serverInfo?.port || PORT,
+            hostname: serverInfo?.hostname || os.hostname()
+        },
+        timestamp: new Date().toISOString()
+    });
+});
 
 // ============================================================
 // SECTION 14: ROOT ENDPOINT
@@ -1275,7 +1241,7 @@ app.get('/', (req, res) => {
     const serverIps = getServerIps();
     
     res.json({
-        name: 'Remote Server - Data Relay & Authentication',
+        name: 'PC/Server Tracking & Authentication System',
         status: 'online',
         version: '3.0.0',
         server_info: {
@@ -1287,22 +1253,9 @@ app.get('/', (req, res) => {
         statistics: {
             total_clients_ever: pcAccessLog.size,
             active_clients: activePCs.size,
-            blocked_ips: blockedAttempts.size,
             local_active: [...activePCs.values()].filter(c => c.is_local).length,
             remote_active: [...activePCs.values()].filter(c => !c.is_local).length,
-            data_records: latestData.records?.length || 0,
-            known_local_servers: knownLocalServers.size
-        },
-        protected_endpoints: {
-            '/testresults': 'Requires whitelisted IP',
-            '/data': 'Requires whitelisted IP',
-            '/data/realtimedata': 'Requires whitelisted IP',
-            '/history': 'Requires whitelisted IP'
-        },
-        data_recovery: {
-            endpoint: '/recover-all',
-            description: 'Recover data from all registered local servers',
-            registered_servers: Array.from(knownLocalServers.keys())
+            data_records: latestData.records?.length || 0
         },
         timestamp: new Date().toISOString()
     });
@@ -1316,23 +1269,17 @@ io.on('connection', (socket) => {
     const branchId = socket.id;
     const fwd = socket.handshake.headers['x-forwarded-for'];
     const clientIp = fwd ? fwd.split(',')[0].trim() : (socket.handshake.address || 'Unknown');
+    const clientMac = socket.handshake.headers['x-mac-address'] || 'Not provided';
+    const isLocal = clientIp === '127.0.0.1' || clientIp === '::1';
+    
     const isWhitelisted = isIpWhitelisted(clientIp);
 
     console.log(`\n🔐 WEBSOCKET CONNECTION:`);
     console.log(`   📍 Client IP: ${clientIp}`);
+    console.log(`   🖥️  MAC:       ${clientMac}`);
     console.log(`   🆔 Socket ID: ${branchId}`);
     console.log(`   🔑 Whitelisted: ${isWhitelisted}`);
-
-    if (!isWhitelisted && clientIp !== '127.0.0.1') {
-        console.log(`❌ WEBSOCKET CONNECTION REJECTED: ${clientIp} not whitelisted`);
-        socket.emit('error', {
-            error: 'Connection Rejected',
-            message: `Your IP (${clientIp}) is not whitelisted.`,
-            timestamp: new Date().toISOString()
-        });
-        socket.disconnect();
-        return;
-    }
+    console.log(`   📍 Type: ${isLocal ? 'LOCAL' : 'REMOTE'}`);
 
     connectedBranches.set(branchId, socket);
 
@@ -1341,6 +1288,7 @@ io.on('connection', (socket) => {
         message: 'Connected to data relay server',
         client_ip: clientIp,
         is_whitelisted: isWhitelisted,
+        is_local: isLocal,
         recordCount: latestData.count || 0,
         lastUpdate: latestData.lastUpdate,
         hasData: !!(latestData.records && latestData.records.length > 0),
@@ -1352,22 +1300,13 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Send initial data if available
-    if (latestData.records && latestData.records.length > 0) {
-        socket.emit('data_update', {
-            type: 'initial',
-            timestamp: new Date().toISOString(),
-            records: latestData.records,
-            count: latestData.count,
-            source: latestData.source
-        });
-        console.log(`📤 Sent initial data (${latestData.count} records) to client ${branchId}`);
-    }
-
-    // Send active clients
+    // Send initial active clients list
     const initialActiveClients = [];
     for (const [ip, info] of activePCs) {
-        initialActiveClients.push({ ip, ...info });
+        initialActiveClients.push({
+            ip: ip,
+            ...info
+        });
     }
     socket.emit('active_clients_update', {
         type: 'initial',
@@ -1375,6 +1314,16 @@ io.on('connection', (socket) => {
         active_clients: initialActiveClients,
         count: initialActiveClients.length
     });
+
+    if (latestData.records && latestData.records.length > 0) {
+        socket.emit('data_update', {
+            type: 'initial',
+            timestamp: new Date().toISOString(),
+            records: latestData.records,
+            count: latestData.count
+        });
+        console.log(`📤 Sent initial data (${latestData.count} records) to client ${branchId}`);
+    }
 
     socket.on('filter_request', (filters) => {
         console.log(`🔍 Client ${branchId} requested filter:`, filters);
@@ -1409,8 +1358,7 @@ io.on('connection', (socket) => {
                 type: 'refresh',
                 timestamp: new Date().toISOString(),
                 records: latestData.records,
-                count: latestData.count,
-                source: latestData.source
+                count: latestData.count
             });
         }
     });
@@ -1429,7 +1377,7 @@ io.on('connection', (socket) => {
             if (socketIds.length === 0) {
                 activePCs.delete(ip);
                 removedCount++;
-                console.log(`🔌 CLIENT DISCONNECTED: ${ip}`);
+                console.log(`🔌 CLIENT DISCONNECTED: ${ip} (${info.is_local ? 'LOCAL' : 'REMOTE'})`);
             } else {
                 info.socket_ids = socketIds;
                 activePCs.set(ip, info);
@@ -1444,191 +1392,7 @@ io.on('connection', (socket) => {
 });
 
 // ============================================================
-// SECTION 16: AUTO-RECOVERY ON STARTUP
-// ============================================================
-
-/**
- * Auto-recover data from local servers when remote server starts
- * This ensures data is not lost even after remote server restart
- */
-async function autoRecoverOnStartup() {
-    console.log('🔄 Running auto-recovery on startup...');
-    
-    // Wait a bit for the server to fully start
-    setTimeout(async () => {
-        try {
-            // First, check if we have any registered local servers
-            if (knownLocalServers.size === 0) {
-                console.log('ℹ️ No local servers registered yet. Data recovery will be attempted when a local server registers.');
-                
-                // Set up a listener for when a local server registers
-                app.post('/register-local-server', async (req, res) => {
-                    // This is the existing endpoint, but we want to trigger recovery after registration
-                    const { serverUrl, secret } = req.body;
-                    
-                    if (!serverUrl) {
-                        return res.status(400).json({
-                            success: false,
-                            error: 'serverUrl is required'
-                        });
-                    }
-                    
-                    knownLocalServers.set(serverUrl, {
-                        lastSeen: new Date().toISOString(),
-                        status: 'registered',
-                        secret: secret || null
-                    });
-                    
-                    console.log(`📝 Local server registered: ${serverUrl}`);
-                    
-                    // Auto-recover from this server immediately
-                    console.log(`🔄 Auto-recovering data from newly registered server: ${serverUrl}`);
-                    
-                    try {
-                        const response = await axios.post(`${serverUrl}/recovery/full`, {
-                            secret: secret
-                        }, {
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'X-Source-Secret': secret || process.env.REMOTE_SECRET
-                            },
-                            timeout: 30000
-                        });
-                        
-                        if (response.data && response.data.success) {
-                            console.log(`✅ Auto-recovery successful from ${serverUrl}`);
-                            
-                            // Update the data
-                            if (response.data.result && response.data.result.recoveryResult) {
-                                const recoveredCount = response.data.result.recoveryResult.recovered || 0;
-                                console.log(`📊 Recovered ${recoveredCount} records from ${serverUrl}`);
-                            }
-                        } else {
-                            console.log(`⚠️ Auto-recovery from ${serverUrl} failed: ${response.data?.message || 'Unknown error'}`);
-                        }
-                    } catch (err) {
-                        console.log(`⚠️ Auto-recovery from ${serverUrl} failed: ${err.message}`);
-                    }
-                    
-                    // Return the registration response
-                    res.json({
-                        success: true,
-                        message: 'Local server registered and auto-recovery triggered',
-                        serverUrl: serverUrl,
-                        timestamp: new Date().toISOString()
-                    });
-                });
-                
-                return;
-            }
-            
-            // We have registered servers, recover from all of them
-            console.log(`📡 Found ${knownLocalServers.size} registered local servers`);
-            
-            let totalRecovered = 0;
-            let totalRecords = 0;
-            
-            for (const [serverUrl, info] of knownLocalServers) {
-                console.log(`📤 Auto-recovering from ${serverUrl}...`);
-                
-                try {
-                    const response = await axios.post(`${serverUrl}/recovery/full`, {
-                        secret: info.secret
-                    }, {
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-Source-Secret': info.secret || process.env.REMOTE_SECRET
-                        },
-                        timeout: 30000
-                    });
-                    
-                    if (response.data && response.data.success) {
-                        console.log(`✅ Auto-recovered from ${serverUrl}`);
-                        
-                        if (response.data.result && response.data.result.recoveryResult) {
-                            const recoveredCount = response.data.result.recoveryResult.recovered || 0;
-                            totalRecords += recoveredCount;
-                            totalRecovered++;
-                            console.log(`📊 Recovered ${recoveredCount} records from ${serverUrl}`);
-                        }
-                    } else {
-                        console.log(`⚠️ Auto-recovery from ${serverUrl} failed: ${response.data?.message || 'Unknown error'}`);
-                    }
-                } catch (err) {
-                    console.log(`⚠️ Auto-recovery from ${serverUrl} failed: ${err.message}`);
-                }
-            }
-            
-            console.log(`✅ Auto-recovery complete: ${totalRecovered} servers, ${totalRecords} total records`);
-            
-            // Broadcast recovery complete
-            io.emit('recovery_complete', {
-                success: true,
-                totalServers: totalRecovered,
-                totalRecords: totalRecords,
-                timestamp: new Date().toISOString()
-            });
-            
-        } catch (err) {
-            console.error('❌ Auto-recovery error:', err.message);
-        }
-    }, 5000); // Wait 5 seconds after startup
-}
-
-// ============================================================
-// SECTION 17: START SERVER
-// ============================================================
-
-server.listen(PORT, '0.0.0.0', () => {
-    const macInfo = getServerMacAddress();
-    const serverIps = getServerIps();
-    
-    console.log(`
-    ═══════════════════════════════════════════════════════
-    🖥️  REMOTE SERVER - DATA RELAY & AUTHENTICATION
-    ═══════════════════════════════════════════════════════
-    📍 Server IP:    ${serverIps.primary}:${PORT}
-    📍 Local URL:    http://localhost:${PORT}
-    🔑 Server MAC:   ${macInfo.mac}
-    🆔 Server ID:    ${macInfo.mac !== 'UNKNOWN' ? macInfo.mac.replace(/:/g, '').toUpperCase() : 'UNKNOWN'}
-    
-    📊 DATA RECOVERY:
-       ✓ Auto-recovery on startup from registered local servers
-       ✓ Manual recovery: POST /recover-all
-       ✓ Register local server: POST /register-local-server
-       ✓ Protected endpoints require whitelisted IPs
-    
-    🔐 PROTECTED ENDPOINTS:
-       GET  /testresults    → View test results
-       GET  /data           → View all data
-       POST /data/realtimedata → Receive data stream
-       GET  /history        → View data history
-    
-    🔑 WHITELIST MANAGEMENT:
-       GET    /whitelist           → View whitelist
-       POST   /whitelist/static    → Add static IPs
-       POST   /whitelist/network   → Add network ranges
-       DELETE /whitelist           → Remove from whitelist
-    
-    💡 To register a local server:
-       POST /register-local-server { "serverUrl": "http://localhost:5000" }
-    
-    💡 To recover data:
-       POST /recover-all
-    
-    ═══════════════════════════════════════════════════════
-    `);
-});
-
-// ============================================================
-// SECTION 18: AUTO-RECOVERY ON STARTUP
-// ============================================================
-
-// Run auto-recovery after server starts
-autoRecoverOnStartup();
-
-// ============================================================
-// SECTION 19: GRACEFUL SHUTDOWN
+// SECTION 16: GRACEFUL SHUTDOWN
 // ============================================================
 
 process.on('SIGINT', () => {
@@ -1646,5 +1410,46 @@ process.on('SIGINT', () => {
 });
 
 // ============================================================
-// END OF REMOTE SERVER
+// SECTION 17: START SERVER
+// ============================================================
+
+server.listen(PORT, '0.0.0.0', () => {
+    const macInfo = getServerMacAddress();
+    const serverIps = getServerIps();
+    
+    console.log(`
+    ═══════════════════════════════════════════════════════
+    🖥️  SERVER TRACKING & AUTHENTICATION SYSTEM (REAL-TIME)
+    ═══════════════════════════════════════════════════════
+    📍 Server IP:    ${serverIps.primary}:${PORT}
+    📍 Local URL:    http://localhost:${PORT}
+    🔑 Server MAC:   ${macInfo.mac} (${macInfo.interface})
+    🆔 Server ID:    ${macInfo.mac !== 'UNKNOWN' ? macInfo.mac.replace(/:/g, '').toUpperCase() : 'UNKNOWN'}
+    
+    📊 TRACKING:
+       GET  /all-pcs           → Currently active clients (real-time)
+       GET  /all-pcs-history   → All clients that ever connected
+       GET  /pc/:ip            → Details for a specific client
+    
+    🔐 AUTHENTICATION:
+       GET  /my-ip        → Your client IP address
+       GET  /my-pc-check  → Your connection status
+       GET  /server-mac   → Server's unique MAC address
+    
+    🔑 WHITELIST MANAGEMENT:
+       GET    /whitelist           → View whitelist
+       POST   /whitelist/static    → Add static IPs
+       POST   /whitelist/network   → Add network ranges
+       DELETE /whitelist           → Remove from whitelist
+    
+    💡 Test from any client:
+       curl http://${serverIps.primary}:${PORT}/my-ip
+       curl http://${serverIps.primary}:${PORT}/all-pcs
+    
+    ═══════════════════════════════════════════════════════
+    `);
+});
+
+// ============================================================
+// END OF SERVER
 // ============================================================
