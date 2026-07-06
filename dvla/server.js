@@ -49,8 +49,11 @@ let connectedBranches = new Map();
 let dataHistory = [];
 const MAX_HISTORY = 50;
 
-// Track all PCs accessing the server
+// Track ALL PCs accessing the server (historical data)
 let pcAccessLog = new Map(); // Key: client_ip, Value: PC info
+
+// Track currently active PCs (real-time connections)
+let activePCs = new Map(); // Key: client_ip, Value: { connectionInfo, lastSeen, socketIds }
 
 // ============================================================
 // SECTION 4: WHITELIST CONFIGURATION
@@ -80,6 +83,7 @@ app.use((req, res, next) => {
 /**
  * Get client IP from various headers
  * Handles proxies, Cloudflare, etc.
+ * This gets the IP of whoever is CONNECTING to this server
  */
 function getClientIp(req) {
     // Check various headers in order of trust
@@ -109,6 +113,49 @@ function getClientIp(req) {
     }
     
     return { clientIp, ipChain, socketIp };
+}
+
+/**
+ * Get server's own IP addresses
+ * This gets the IP of THIS SERVER (not the client)
+ */
+function getServerIps() {
+    const interfaces = os.networkInterfaces();
+    const ips = {
+        ipv4: [],
+        ipv6: []
+    };
+    
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            // Skip internal (loopback) addresses
+            if (iface.internal) continue;
+            
+            if (iface.family === 'IPv4') {
+                ips.ipv4.push({
+                    interface: name,
+                    address: iface.address,
+                    netmask: iface.netmask,
+                    mac: iface.mac
+                });
+            } else if (iface.family === 'IPv6') {
+                ips.ipv6.push({
+                    interface: name,
+                    address: iface.address,
+                    netmask: iface.netmask,
+                    mac: iface.mac
+                });
+            }
+        }
+    }
+    
+    // Also get localhost
+    ips.localhost = '127.0.0.1';
+    
+    // Get primary IP (first non-internal IPv4)
+    ips.primary = ips.ipv4.length > 0 ? ips.ipv4[0].address : '127.0.0.1';
+    
+    return ips;
 }
 
 /**
@@ -150,56 +197,13 @@ function getServerMacAddress() {
         }
     }
     
-    // Fallback: generate a unique ID based on hostname and timestamp
-    // This should only happen in very rare cases
+    // Fallback
     return {
         mac: 'UNKNOWN',
         interface: 'unknown',
         family: 'unknown',
         address: 'unknown'
     };
-}
-
-/**
- * Get server IP addresses
- */
-function getServerIps() {
-    const interfaces = os.networkInterfaces();
-    const ips = {
-        ipv4: [],
-        ipv6: []
-    };
-    
-    for (const name of Object.keys(interfaces)) {
-        for (const iface of interfaces[name]) {
-            // Skip internal (loopback) addresses
-            if (iface.internal) continue;
-            
-            if (iface.family === 'IPv4') {
-                ips.ipv4.push({
-                    interface: name,
-                    address: iface.address,
-                    netmask: iface.netmask,
-                    mac: iface.mac
-                });
-            } else if (iface.family === 'IPv6') {
-                ips.ipv6.push({
-                    interface: name,
-                    address: iface.address,
-                    netmask: iface.netmask,
-                    mac: iface.mac
-                });
-            }
-        }
-    }
-    
-    // Also get localhost
-    ips.localhost = '127.0.0.1';
-    
-    // Get primary IP (first non-internal IPv4)
-    ips.primary = ips.ipv4.length > 0 ? ips.ipv4[0].address : '127.0.0.1';
-    
-    return ips;
 }
 
 /**
@@ -256,25 +260,30 @@ function isIpWhitelisted(ip) {
  */
 function getClientNetworkInfo(req) {
     const { clientIp, ipChain, socketIp } = getClientIp(req);
+    const serverIps = getServerIps();
     
     return {
-        client_ip: clientIp || 'Unknown',
-        ip_chain: ipChain || [],
-        socket: {
-            remoteAddress: socketIp || 'Unknown',
-            remotePort: req.socket?.remotePort || 'Unknown',
-            localAddress: req.socket?.localAddress || 'Unknown',
-            localPort: req.socket?.localPort || 'Unknown'
+        // The client who is connecting
+        client: {
+            ip: clientIp || 'Unknown',
+            ip_chain: ipChain || [],
+            socket: {
+                remoteAddress: socketIp || 'Unknown',
+                remotePort: req.socket?.remotePort || 'Unknown'
+            },
+            user_agent: req.headers['user-agent'] || 'Unknown',
+            host: req.headers['host'] || 'Unknown',
+            origin: req.headers['origin'] || null,
+            is_whitelisted: isIpWhitelisted(clientIp)
         },
-        headers: {
-            forwarded: req.headers['x-forwarded-for'] || null,
-            real_ip: req.headers['x-real-ip'] || null,
-            cf_connecting_ip: req.headers['cf-connecting-ip'] || null
+        // The server they are connecting to
+        server: {
+            primary_ip: serverIps.primary,
+            all_ipv4: serverIps.ipv4,
+            port: PORT,
+            hostname: os.hostname()
         },
-        user_agent: req.headers['user-agent'] || 'Unknown',
-        host: req.headers['host'] || 'Unknown',
-        origin: req.headers['origin'] || null,
-        is_whitelisted: isIpWhitelisted(clientIp)
+        connection_type: clientIp === '127.0.0.1' ? 'LOCAL' : 'REMOTE'
     };
 }
 
@@ -283,40 +292,52 @@ function getClientNetworkInfo(req) {
 // ============================================================
 
 /**
- * Middleware to track all PCs accessing the server
+ * Middleware to track all PCs/servers accessing this server
  */
 app.use((req, res, next) => {
     const networkInfo = getClientNetworkInfo(req);
-    const clientIp = networkInfo.client_ip;
+    const clientIp = networkInfo.client.ip;
+    const isWhitelisted = networkInfo.client.is_whitelisted;
+    const isLocal = networkInfo.connection_type === 'LOCAL';
+    
+    // Store in request for later use
+    req.clientInfo = networkInfo.client;
+    req.serverInfo = networkInfo.server;
+    req.connectionType = networkInfo.connection_type;
     
     if (clientIp && clientIp !== 'Unknown' && clientIp !== '127.0.0.1') {
-        // Check if this PC already exists
+        // Update historical log
         if (!pcAccessLog.has(clientIp)) {
-            // New PC detected
+            // New PC/Server detected
             pcAccessLog.set(clientIp, {
                 first_seen: new Date().toISOString(),
                 last_seen: new Date().toISOString(),
                 total_requests: 0,
-                ip_chain: networkInfo.ip_chain,
-                socket_ip: networkInfo.socket.remoteAddress,
-                user_agent: networkInfo.user_agent,
-                host: networkInfo.host,
-                is_whitelisted: networkInfo.is_whitelisted,
+                ip_chain: networkInfo.client.ip_chain,
+                socket_ip: networkInfo.client.socket.remoteAddress,
+                user_agent: networkInfo.client.user_agent,
+                host: networkInfo.client.host,
+                is_whitelisted: isWhitelisted,
+                is_local: isLocal,
                 request_history: [],
-                endpoints_accessed: []
+                endpoints_accessed: [],
+                total_connections: 0,
+                connection_type: networkInfo.connection_type
             });
-            console.log(`🆕 NEW PC DETECTED: ${clientIp} (Whitelisted: ${networkInfo.is_whitelisted})`);
+            console.log(`🆕 NEW ${isLocal ? 'LOCAL' : 'REMOTE'} CLIENT DETECTED: ${clientIp} (Whitelisted: ${isWhitelisted})`);
         }
         
         // Update existing PC record
         const pcRecord = pcAccessLog.get(clientIp);
         pcRecord.last_seen = new Date().toISOString();
         pcRecord.total_requests += 1;
-        pcRecord.ip_chain = networkInfo.ip_chain;
-        pcRecord.socket_ip = networkInfo.socket.remoteAddress;
-        pcRecord.user_agent = networkInfo.user_agent || pcRecord.user_agent;
-        pcRecord.host = networkInfo.host || pcRecord.host;
-        pcRecord.is_whitelisted = networkInfo.is_whitelisted;
+        pcRecord.ip_chain = networkInfo.client.ip_chain;
+        pcRecord.socket_ip = networkInfo.client.socket.remoteAddress;
+        pcRecord.user_agent = networkInfo.client.user_agent || pcRecord.user_agent;
+        pcRecord.host = networkInfo.client.host || pcRecord.host;
+        pcRecord.is_whitelisted = isWhitelisted;
+        pcRecord.is_local = isLocal;
+        pcRecord.connection_type = networkInfo.connection_type;
         
         // Track endpoint accessed
         if (req.originalUrl) {
@@ -338,6 +359,47 @@ app.use((req, res, next) => {
         }
         
         pcAccessLog.set(clientIp, pcRecord);
+        
+        // Update active PCs
+        if (!activePCs.has(clientIp)) {
+            // New active connection
+            const socketId = req.socket?.id || 'http';
+            activePCs.set(clientIp, {
+                connected_at: new Date().toISOString(),
+                last_seen: new Date().toISOString(),
+                socket_ids: [socketId],
+                ip_chain: networkInfo.client.ip_chain,
+                user_agent: networkInfo.client.user_agent,
+                is_whitelisted: isWhitelisted,
+                is_local: isLocal,
+                connection_type: networkInfo.connection_type,
+                requests_in_session: 1,
+                server_info: networkInfo.server
+            });
+            console.log(`✅ ${isLocal ? 'LOCAL' : 'REMOTE'} CLIENT CONNECTED: ${clientIp} (Active sessions: ${activePCs.size})`);
+            
+            // Broadcast active PCs update
+            broadcastActivePCs();
+        } else {
+            // Update existing active connection
+            const activeRecord = activePCs.get(clientIp);
+            activeRecord.last_seen = new Date().toISOString();
+            activeRecord.requests_in_session += 1;
+            activeRecord.ip_chain = networkInfo.client.ip_chain;
+            activeRecord.user_agent = networkInfo.client.user_agent;
+            activeRecord.is_whitelisted = isWhitelisted;
+            activeRecord.is_local = isLocal;
+            activeRecord.connection_type = networkInfo.connection_type;
+            activeRecord.server_info = networkInfo.server;
+            
+            // Add socket ID if not present
+            const socketId = req.socket?.id || 'http';
+            if (!activeRecord.socket_ids.includes(socketId)) {
+                activeRecord.socket_ids.push(socketId);
+            }
+            
+            activePCs.set(clientIp, activeRecord);
+        }
     }
     
     next();
@@ -352,19 +414,12 @@ app.use((req, res, next) => {
  * Returns 403 if IP is not whitelisted
  */
 const authenticateBranch = async (req, res, next) => {
-    const networkInfo = getClientNetworkInfo(req);
-    const clientIp = networkInfo.client_ip;
-    const isWhitelisted = networkInfo.is_whitelisted;
-    
-    // Store client IP in request for later use
-    req.clientIp = clientIp;
-    req.isWhitelisted = isWhitelisted;
-    req.networkInfo = networkInfo;
-    
+    const clientIp = req.clientInfo?.ip || 'Unknown';
+    const isWhitelisted = req.clientInfo?.is_whitelisted || false;
     
     // Check if whitelisted
     if (!isWhitelisted) {
-        console.log(`❌ ENDPOINT ACCESS DENIED`);
+        console.log(`❌ ENDPOINT ACCESS DENIED for ${clientIp}`);
         
         // Update PC record with failed attempt
         if (pcAccessLog.has(clientIp)) {
@@ -377,7 +432,8 @@ const authenticateBranch = async (req, res, next) => {
         return res.status(403).json({
             success: false,
             error: 'Access Denied',
-            message: `contact network administrator for clarification`,
+            message: `Your IP (${clientIp}) is not whitelisted. Contact network administrator.`,
+            your_ip: clientIp,
             timestamp: new Date().toISOString()
         });
     }
@@ -409,24 +465,16 @@ app.get('/whitelist', (req, res) => {
 
 /**
  * Add static IPs to whitelist
- * Supports both formats:
- * 1. { ips: ['192.168.1.100', '10.0.0.5'] }
- * 2. { ipData: [{ ipAddress: '192.168.1.100', name: 'Test' }] }
  */
 app.post('/whitelist/static', (req, res) => {
     let ipsToAdd = [];
     
-    // Check if the request is from the local server (ipData format)
     if (req.body.ipData && Array.isArray(req.body.ipData)) {
-        // Extract IP addresses from ipData array
         ipsToAdd = req.body.ipData
             .map(item => item.ipAddress || item.ip)
             .filter(Boolean);
-        
         console.log(`📥 Received IP data from local server: ${ipsToAdd.length} IPs`);
-    } 
-    // Check if it's the standard format
-    else if (req.body.ips) {
+    } else if (req.body.ips) {
         const ips = Array.isArray(req.body.ips) ? req.body.ips : [req.body.ips];
         ipsToAdd = ips.map(ip => ip.trim()).filter(Boolean);
     }
@@ -435,8 +483,7 @@ app.post('/whitelist/static', (req, res) => {
         return res.status(400).json({
             success: false,
             error: 'Missing field: ips or ipData',
-            example: { ips: ['192.168.1.100', '10.0.0.5'] },
-            example2: { ipData: [{ ipAddress: '192.168.1.100', name: 'Test' }] }
+            example: { ips: ['192.168.1.100', '10.0.0.5'] }
         });
     }
 
@@ -453,12 +500,19 @@ app.post('/whitelist/static', (req, res) => {
                 record.is_whitelisted = true;
                 pcAccessLog.set(ip, record);
             }
+            // Update active PC record
+            if (activePCs.has(ip)) {
+                const activeRecord = activePCs.get(ip);
+                activeRecord.is_whitelisted = true;
+                activePCs.set(ip, activeRecord);
+            }
         } else {
             alreadyExist.push(ip);
         }
     }
 
     console.log(`📝 Whitelist updated: Added ${added.length} static IPs`);
+    broadcastActivePCs();
 
     res.json({
         success: true,
@@ -472,7 +526,6 @@ app.post('/whitelist/static', (req, res) => {
 
 /**
  * Add network ranges to whitelist
- * Body: { networks: ['192.168.1.0/24', '10.0.0.0/8'] }
  */
 app.post('/whitelist/network', (req, res) => {
     const { networks } = req.body;
@@ -493,7 +546,6 @@ app.post('/whitelist/network', (req, res) => {
     const alreadyExist = [];
     
     for (const network of incoming) {
-        // Validate CIDR format
         if (!network.includes('/')) {
             return res.status(400).json({
                 success: false,
@@ -511,12 +563,20 @@ app.post('/whitelist/network', (req, res) => {
                     pcAccessLog.set(ip, record);
                 }
             }
+            // Update active PCs
+            for (const [ip, record] of activePCs) {
+                if (isIpInNetwork(ip, network)) {
+                    record.is_whitelisted = true;
+                    activePCs.set(ip, record);
+                }
+            }
         } else {
             alreadyExist.push(network);
         }
     }
 
     console.log(`📝 Whitelist updated: Added ${added.length} networks`);
+    broadcastActivePCs();
 
     res.json({
         success: true,
@@ -530,7 +590,6 @@ app.post('/whitelist/network', (req, res) => {
 
 /**
  * Remove from whitelist
- * Body: { type: 'static'|'network', value: '192.168.1.100' }
  */
 app.delete('/whitelist', (req, res) => {
     const { type, value } = req.body;
@@ -550,11 +609,15 @@ app.delete('/whitelist', (req, res) => {
         if (index !== -1) {
             whitelistedStaticIps.splice(index, 1);
             removed = true;
-            // Update PC record
             if (pcAccessLog.has(value)) {
                 const record = pcAccessLog.get(value);
                 record.is_whitelisted = false;
                 pcAccessLog.set(value, record);
+            }
+            if (activePCs.has(value)) {
+                const record = activePCs.get(value);
+                record.is_whitelisted = false;
+                activePCs.set(value, record);
             }
         }
     } else if (type === 'network') {
@@ -562,29 +625,16 @@ app.delete('/whitelist', (req, res) => {
         if (index !== -1) {
             whitelistedNetworks.splice(index, 1);
             removed = true;
-            // Re-check all PCs
             for (const [ip, record] of pcAccessLog) {
                 record.is_whitelisted = isIpWhitelisted(ip);
                 pcAccessLog.set(ip, record);
             }
-        }
-        } else { 
-        const index = whitelistedStaticIps.indexOf(value);
-        if (index !== -1) {
-            whitelistedStaticIps.splice(index, 1);
-            removed = true;
-            // Update PC record
-            if (pcAccessLog.has(value)) {
-                const record = pcAccessLog.get(value);
-                record.is_whitelisted = false;
-                pcAccessLog.set(value, record);
+            for (const [ip, record] of activePCs) {
+                record.is_whitelisted = isIpWhitelisted(ip);
+                activePCs.set(ip, record);
             }
         }
-
-
-
-
-        }
+    }
 
     if (!removed) {
         return res.status(404).json({
@@ -594,6 +644,7 @@ app.delete('/whitelist', (req, res) => {
     }
 
     console.log(`🗑️ Whitelist updated: Removed ${type} ${value}`);
+    broadcastActivePCs();
 
     res.json({
         success: true,
@@ -611,13 +662,15 @@ app.delete('/whitelist', (req, res) => {
 // ============================================================
 
 /**
- * Show ALL PCs that have accessed this server
+ * Show ALL clients that have EVER accessed this server (historical)
  */
-app.get('/all-pcs', (req, res) => {
+app.get('/all-pcs-history', (req, res) => {
     const allPCs = [];
     let whitelistedCount = 0;
     let totalRequests = 0;
     let deniedCount = 0;
+    let localCount = 0;
+    let remoteCount = 0;
     
     for (const [ip, info] of pcAccessLog) {
         allPCs.push({
@@ -625,24 +678,28 @@ app.get('/all-pcs', (req, res) => {
             ...info
         });
         if (info.is_whitelisted) whitelistedCount++;
+        if (info.is_local) localCount++;
+        else remoteCount++;
         totalRequests += info.total_requests;
         deniedCount += (info.denied_count || 0);
     }
     
-    // Sort by last_seen (most recent first)
     allPCs.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
     
     res.json({
         success: true,
+        type: 'historical',
         summary: {
-            total_pcs: allPCs.length,
-            whitelisted_pcs: whitelistedCount,
-            unwhitelisted_pcs: allPCs.length - whitelistedCount,
+            total_clients_ever: allPCs.length,
+            whitelisted_clients: whitelistedCount,
+            unwhitelisted_clients: allPCs.length - whitelistedCount,
+            local_connections: localCount,
+            remote_connections: remoteCount,
             total_requests: totalRequests,
             total_denied: deniedCount,
             last_updated: new Date().toISOString()
         },
-        pcs: allPCs,
+        clients: allPCs,
         whitelist: {
             static_ips: whitelistedStaticIps,
             networks: whitelistedNetworks
@@ -652,7 +709,53 @@ app.get('/all-pcs', (req, res) => {
 });
 
 /**
- * Show details for a specific PC
+ * Show CURRENTLY ACTIVE clients (real-time)
+ */
+app.get('/all-pcs', (req, res) => {
+    const activePCsList = [];
+    let whitelistedCount = 0;
+    let localCount = 0;
+    let remoteCount = 0;
+    
+    for (const [ip, info] of activePCs) {
+        activePCsList.push({
+            ip: ip,
+            ...info
+        });
+        if (info.is_whitelisted) whitelistedCount++;
+        if (info.is_local) localCount++;
+        else remoteCount++;
+    }
+    
+    activePCsList.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
+    
+    res.json({
+        success: true,
+        type: 'real-time',
+        summary: {
+            active_clients: activePCs.size,
+            whitelisted_active: whitelistedCount,
+            unwhitelisted_active: activePCs.size - whitelistedCount,
+            local_active: localCount,
+            remote_active: remoteCount,
+            last_updated: new Date().toISOString()
+        },
+        active_clients: activePCsList,
+        whitelist: {
+            static_ips: whitelistedStaticIps,
+            networks: whitelistedNetworks
+        },
+        server_info: {
+            primary_ip: getServerIps().primary,
+            port: PORT,
+            hostname: os.hostname()
+        },
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
+ * Show details for a specific client
  */
 app.get('/pc/:ip', (req, res) => {
     const ip = req.params.ip;
@@ -660,80 +763,123 @@ app.get('/pc/:ip', (req, res) => {
     if (!pcAccessLog.has(ip)) {
         return res.status(404).json({
             success: false,
-            error: 'PC not found',
-            message: `No PC with IP ${ip} has accessed this server`
+            error: 'Client not found',
+            message: `No client with IP ${ip} has accessed this server`
         });
     }
     
     const pcInfo = pcAccessLog.get(ip);
+    const isActive = activePCs.has(ip);
+    const activeInfo = isActive ? activePCs.get(ip) : null;
     
     res.json({
         success: true,
-        pc: {
+        client: {
             ip: ip,
-            ...pcInfo
+            ...pcInfo,
+            currently_active: isActive,
+            active_session: activeInfo ? {
+                connected_at: activeInfo.connected_at,
+                last_seen: activeInfo.last_seen,
+                requests_in_session: activeInfo.requests_in_session,
+                socket_ids: activeInfo.socket_ids,
+                server_connected_to: activeInfo.server_info
+            } : null
         },
         timestamp: new Date().toISOString()
     });
 });
 
 /**
- * Clear PC access log
+ * Clear PC access log (historical only)
  */
-app.delete('/all-pcs', (req, res) => {
+app.delete('/all-pcs-history', (req, res) => {
     const count = pcAccessLog.size;
     pcAccessLog.clear();
     
-    console.log(`🗑️ PC access log cleared (${count} PCs removed)`);
+    console.log(`🗑️ Client history cleared (${count} clients removed from history)`);
     
     res.json({
         success: true,
-        message: `Cleared PC access log`,
+        message: `Cleared client history (${count} clients)`,
         removed_count: count,
+        active_clients_remain: activePCs.size,
         timestamp: new Date().toISOString()
     });
 });
 
 /**
- * Check your own PC's network info and whitelist status
+ * Remove a specific client from active list (force disconnect)
  */
-app.get('/my-pc-check', (req, res) => {
-    const networkInfo = getClientNetworkInfo(req);
-    const clientIp = networkInfo.client_ip;
-    const isWhitelisted = networkInfo.is_whitelisted;
+app.delete('/pc/:ip/disconnect', (req, res) => {
+    const ip = req.params.ip;
     
-    console.log(`\n🖥️ PC CHECK from ${clientIp}`);
-    console.log(`   IP Chain: ${networkInfo.ip_chain.join(' -> ')}`);
-    console.log(`   Whitelisted: ${isWhitelisted}`);
+    if (!activePCs.has(ip)) {
+        return res.status(404).json({
+            success: false,
+            error: 'Client not active',
+            message: `No active client with IP ${ip}`
+        });
+    }
     
-    const pcHistory = pcAccessLog.get(clientIp);
+    const activeInfo = activePCs.get(ip);
+    activePCs.delete(ip);
+    
+    console.log(`🔌 CLIENT DISCONNECTED (forced): ${ip} (${activeInfo.is_local ? 'LOCAL' : 'REMOTE'})`);
+    
+    broadcastActivePCs();
     
     res.json({
         success: true,
-        your_pc_network_info: {
+        message: `Client ${ip} disconnected`,
+        client_type: activeInfo.is_local ? 'LOCAL' : 'REMOTE',
+        disconnected_at: new Date().toISOString(),
+        timestamp: new Date().toISOString()
+    });
+});
+
+/**
+ * Check your own client info and connection status
+ */
+app.get('/my-pc-check', (req, res) => {
+    const clientInfo = req.clientInfo;
+    const serverInfo = req.serverInfo;
+    const connectionType = req.connectionType;
+    const clientIp = clientInfo?.ip || 'Unknown';
+    const isWhitelisted = clientInfo?.is_whitelisted || false;
+    const isActive = activePCs.has(clientIp);
+    
+    console.log(`\n🖥️ CLIENT CHECK from ${clientIp} (${connectionType})`);
+    
+    const pcHistory = pcAccessLog.get(clientIp);
+    const activeInfo = activePCs.get(clientIp);
+    
+    res.json({
+        success: true,
+        your_info: {
             client_ip: clientIp,
-            ip_chain: networkInfo.ip_chain,
-            socket: {
-                remote_address: networkInfo.socket.remoteAddress,
-                remote_port: networkInfo.socket.remotePort,
-                local_address: networkInfo.socket.localAddress,
-                local_port: networkInfo.socket.localPort
-            },
-            headers: networkInfo.headers,
-            user_agent: networkInfo.user_agent,
-            host: networkInfo.host,
-            origin: networkInfo.origin,
+            connection_type: connectionType,
+            is_local: connectionType === 'LOCAL',
             is_whitelisted: isWhitelisted,
+            is_active: isActive,
+            active_since: activeInfo?.connected_at || null,
+            last_seen: activeInfo?.last_seen || null,
             total_requests: pcHistory?.total_requests || 0,
             first_seen: pcHistory?.first_seen || null,
-            last_seen: pcHistory?.last_seen || null,
-            denied_count: pcHistory?.denied_count || 0
+            denied_count: pcHistory?.denied_count || 0,
+            user_agent: clientInfo?.user_agent || 'Unknown'
+        },
+        server_you_are_connecting_to: {
+            primary_ip: serverInfo?.primary_ip || 'Unknown',
+            port: serverInfo?.port || PORT,
+            hostname: serverInfo?.hostname || os.hostname(),
+            all_ips: serverInfo?.all_ipv4 || []
         },
         whitelist_status: {
             status: isWhitelisted ? '✅ AUTHORIZED' : '❌ NOT AUTHORIZED',
             message: isWhitelisted 
-                ? `Your PC (${clientIp}) is authorized to access protected endpoints`
-                : `Your PC (${clientIp || 'unknown'}) is NOT authorized to access protected endpoints`
+                ? `Your client (${clientIp}) is authorized to access protected endpoints`
+                : `Your client (${clientIp || 'unknown'}) is NOT authorized to access protected endpoints`
         },
         server_whitelist: {
             static_ips: whitelistedStaticIps,
@@ -744,17 +890,16 @@ app.get('/my-pc-check', (req, res) => {
 });
 
 /**
- * Get your server's unique MAC address (this never changes)
+ * Get your server's unique MAC address
  */
 app.get('/server-mac', (req, res) => {
     const macInfo = getServerMacAddress();
     const serverIps = getServerIps();
     
-    console.log(`\n🔑 SERVER MAC QUERY from ${req.clientIp || 'unknown'}`);
+    console.log(`\n🔑 SERVER MAC QUERY from ${req.clientInfo?.ip || 'unknown'}`);
     console.log(`   MAC Address: ${macInfo.mac}`);
     console.log(`   Interface: ${macInfo.interface}`);
     
-    // Generate a unique server ID based on MAC address
     const serverId = macInfo.mac !== 'UNKNOWN' 
         ? macInfo.mac.replace(/:/g, '').toUpperCase()
         : 'UNKNOWN_SERVER';
@@ -787,13 +932,14 @@ app.get('/server-mac', (req, res) => {
 });
 
 /**
- * Get your server IP address (the IP you're connecting from)
+ * Get your own server IP address (the IP you're connecting from)
  */
 app.get('/my-ip', (req, res) => {
-    const networkInfo = getClientNetworkInfo(req);
-    const clientIp = networkInfo.client_ip;
+    const clientInfo = req.clientInfo;
+    const serverInfo = req.serverInfo;
+    const connectionType = req.connectionType;
+    const clientIp = clientInfo?.ip || 'Unknown';
     
-    // Get all possible IPs from headers and socket
     const allIps = {
         detected_ip: clientIp,
         x_forwarded_for: req.headers['x-forwarded-for'] || null,
@@ -803,14 +949,20 @@ app.get('/my-ip', (req, res) => {
         socket_local_address: req.socket?.localAddress || null
     };
     
-    console.log(`\n🌐 IP QUERY from ${clientIp}`);
-    console.log(`   All detected IPs:`, allIps);
+    console.log(`\n🌐 IP QUERY from ${clientIp} (${connectionType})`);
     
     res.json({
         success: true,
-        message: "Your server IP address",
-        your_server_ip: clientIp,
+        message: "Your client IP address",
+        your_client_ip: clientIp,
+        connection_type: connectionType,
+        is_local: connectionType === 'LOCAL',
         all_detected_ips: allIps,
+        server_info: {
+            primary_ip: serverInfo?.primary_ip || 'Unknown',
+            port: serverInfo?.port || PORT,
+            hostname: serverInfo?.hostname || os.hostname()
+        },
         timestamp: new Date().toISOString()
     });
 });
@@ -821,12 +973,10 @@ app.get('/my-ip', (req, res) => {
 
 /**
  * TEST RESULTS endpoint - Protected by whitelist
- * GET /testresults - Returns the latest data
  */
 app.get('/testresults', authenticateBranch, (req, res) => {
-    console.log(`📊 TEST RESULTS requested by ${req.clientIp}`);
+    console.log(`📊 TEST RESULTS requested by ${req.clientInfo?.ip}`);
     
-    // Check if we have data
     if (!latestData.records || latestData.records.length === 0) {
         return res.json({
             success: true,
@@ -852,16 +1002,11 @@ app.get('/testresults', authenticateBranch, (req, res) => {
 
 /**
  * DATA endpoint - Protected by whitelist
- * GET /data - Returns all records
  */
 app.get('/data', authenticateBranch, (req, res) => {
-    // console.log(`📊 DATA requested by ${req.clientIp}`);
-    
     res.json({
         success: true,
         message: 'Protected data endpoint',
-        // your_ip: req.clientIp,
-        // is_whitelisted: req.isWhitelisted,
         records: latestData.records || [],       
         timestamp: new Date().toISOString()
     });
@@ -877,18 +1022,16 @@ app.post('/data/realtimedata', async (req, res) => {
     const expectedSecret = process.env.REMOTE_SECRET;
 
     console.log(`\n📡 STREAM RECEIVED at ${new Date().toISOString()}`);
-    console.log(`   From IP: ${req.clientIp}`);
+    console.log(`   From IP: ${req.clientInfo?.ip}`);
+    console.log(`   Connection: ${req.connectionType}`);
     console.log(`   Records: ${count || (records && records.length) || 0}`);
-    console.log(`   Source:  ${source || 'local_pc'}`);
-    console.log(`   Table:   ${table || 'unknown'}`);
 
-    // Check secret (if configured)
     if (expectedSecret && sourceSecret !== expectedSecret) {
         console.log(`❌ Invalid secret — rejecting data`);
         return res.status(401).json({
             success: false,
             error: 'Invalid secret',
-            your_ip: req.clientIp
+            your_ip: req.clientInfo?.ip
         });
     }
 
@@ -897,41 +1040,30 @@ app.post('/data/realtimedata', async (req, res) => {
         return res.json({ 
             success: true, 
             message: 'No data to process',
-            your_ip: req.clientIp
+            your_ip: req.clientInfo?.ip
         });
     }
 
-    // Store the data
     latestData = {
         records: records,
         lastUpdate: new Date().toISOString(),
-        // source: source || 'local_pc',
-        // table: table || 'unknown',
-        // count: records.length,
         receivedAt: timestamp || new Date().toISOString()
     };
 
-    // Add to history
     dataHistory.unshift({
         timestamp: new Date().toISOString(),
         recordCount: records.length,
         source: source || 'local_pc',
-        from_ip: req.clientIp
+        from_ip: req.clientInfo?.ip,
+        connection_type: req.connectionType
     });
 
     if (dataHistory.length > MAX_HISTORY) dataHistory.pop();
 
-    // console.log(`✅ Data stored: ${records.length} records`);
-
-    // Broadcast to connected branches
     const broadcastPayload = {
         type: 'live_update',
         timestamp: new Date().toISOString(),
         records: records
-        // count: records.length,
-        // source: source || 'local_pc',
-        // table: table || 'unknown',
-        // from_ip: req.clientIp
     };
 
     let branchesNotified = 0;
@@ -944,14 +1076,11 @@ app.post('/data/realtimedata', async (req, res) => {
         }
     }
 
-    // console.log(`📢 Broadcast to ${branchesNotified} connected branch offices`);
-
     res.json({
         success: true,
         received: records.length,
         stored: true,
         branchesNotified: branchesNotified,
-        // your_ip: req.clientIp,
         timestamp: new Date().toISOString()
     });
 });
@@ -960,15 +1089,11 @@ app.post('/data/realtimedata', async (req, res) => {
 // SECTION 12: DATA HISTORY ENDPOINT
 // ============================================================
 
-/**
- * Get data history
- */
 app.get('/history', authenticateBranch, (req, res) => {
     const { limit = 20 } = req.query;
     
     res.json({
         success: true,
-        // your_ip: req.clientIp,
         history: dataHistory.slice(0, parseInt(limit)),
         total: dataHistory.length,
         timestamp: new Date().toISOString()
@@ -976,50 +1101,66 @@ app.get('/history', authenticateBranch, (req, res) => {
 });
 
 // ============================================================
-// SECTION 13: ROOT ENDPOINT
+// SECTION 13: BROADCAST FUNCTIONS
+// ============================================================
+
+function broadcastActivePCs() {
+    const activePCsList = [];
+    for (const [ip, info] of activePCs) {
+        activePCsList.push({
+            ip: ip,
+            ...info
+        });
+    }
+    
+    const payload = {
+        type: 'active_clients_update',
+        timestamp: new Date().toISOString(),
+        active_clients: activePCsList,
+        count: activePCsList.length,
+        local_count: activePCsList.filter(c => c.is_local).length,
+        remote_count: activePCsList.filter(c => !c.is_local).length
+    };
+    
+    for (const [branchId, branchSocket] of connectedBranches) {
+        try {
+            branchSocket.emit('active_clients_update', payload);
+        } catch (err) {
+            console.log(`⚠️ Failed to broadcast active clients to ${branchId}: ${err.message}`);
+        }
+    }
+}
+
+// ============================================================
+// SECTION 14: ROOT ENDPOINT
 // ============================================================
 
 app.get('/', (req, res) => {
-    const networkInfo = getClientNetworkInfo(req);
-    const isWhitelisted = networkInfo.is_whitelisted;
+    const serverIps = getServerIps();
     
     res.json({
-        name: 'PC Tracking & Authentication Server',
+        name: 'PC/Server Tracking & Authentication System',
         status: 'online',
         version: '3.0.0',
-        total_pcs_tracked: pcAccessLog.size,
-        // your_network: {
-        //     client_ip: networkInfo.client_ip,
-        //     ip_chain: networkInfo.ip_chain,
-        //     socket_ip: networkInfo.socket.remoteAddress,
-        //     is_whitelisted: isWhitelisted
-        // },
-        // endpoints: {
-        //     'GET /': 'Server information',
-        //     'GET /my-pc-check': 'Show your PC network information',
-        //     'GET /all-pcs': 'Show ALL PCs that have accessed this server',
-        //     'GET /pc/:ip': 'Show details for a specific PC',
-        //     'DELETE /all-pcs': 'Clear PC access log',
-        //     'GET /whitelist': 'View whitelist',
-        //     'POST /whitelist/static': 'Add static IPs to whitelist',
-        //     'POST /whitelist/network': 'Add network ranges to whitelist',
-        //     'DELETE /whitelist': 'Remove from whitelist',
-        //     'GET /testresults': 'Get test results (WHITELIST PROTECTED)',
-        //     'GET /data': 'Get data (WHITELIST PROTECTED)',
-        //     'POST /data/realtimedata': 'Receive data stream (WHITELIST PROTECTED)',
-        //     'GET /history': 'View data history (WHILIST PROTECTED)'
-        // },
-        // protected_endpoints: {
-        //     '/testresults': 'Requires whitelisted IP',
-        //     '/data': 'Requires whitelisted IP',
-        //     '/data/realtimedata': 'Requires whitelisted IP'
-        // },
+        server_info: {
+            primary_ip: serverIps.primary,
+            all_ipv4: serverIps.ipv4,
+            port: PORT,
+            hostname: os.hostname()
+        },
+        statistics: {
+            total_clients_ever: pcAccessLog.size,
+            active_clients: activePCs.size,
+            local_active: [...activePCs.values()].filter(c => c.is_local).length,
+            remote_active: [...activePCs.values()].filter(c => !c.is_local).length,
+            data_records: latestData.records?.length || 0
+        },
         timestamp: new Date().toISOString()
     });
 });
 
 // ============================================================
-// SECTION 14: WEBSOCKET HANDLING
+// SECTION 15: WEBSOCKET HANDLING
 // ============================================================
 
 io.on('connection', (socket) => {
@@ -1027,8 +1168,8 @@ io.on('connection', (socket) => {
     const fwd = socket.handshake.headers['x-forwarded-for'];
     const clientIp = fwd ? fwd.split(',')[0].trim() : (socket.handshake.address || 'Unknown');
     const clientMac = socket.handshake.headers['x-mac-address'] || 'Not provided';
+    const isLocal = clientIp === '127.0.0.1' || clientIp === '::1';
     
-    // Check if IP is whitelisted
     const isWhitelisted = isIpWhitelisted(clientIp);
 
     console.log(`\n🔐 WEBSOCKET CONNECTION:`);
@@ -1036,37 +1177,54 @@ io.on('connection', (socket) => {
     console.log(`   🖥️  MAC:       ${clientMac}`);
     console.log(`   🆔 Socket ID: ${branchId}`);
     console.log(`   🔑 Whitelisted: ${isWhitelisted}`);
+    console.log(`   📍 Type: ${isLocal ? 'LOCAL' : 'REMOTE'}`);
 
-    // Store branch connection
     connectedBranches.set(branchId, socket);
 
-    // Send connection confirmation
     socket.emit('connected', {
         status: 'connected',
         message: 'Connected to data relay server',
         client_ip: clientIp,
         is_whitelisted: isWhitelisted,
+        is_local: isLocal,
         recordCount: latestData.count || 0,
         lastUpdate: latestData.lastUpdate,
-        hasData: !!(latestData.records && latestData.records.length > 0)
+        hasData: !!(latestData.records && latestData.records.length > 0),
+        active_clients: activePCs.size,
+        server_info: {
+            primary_ip: getServerIps().primary,
+            port: PORT,
+            hostname: os.hostname()
+        }
     });
 
-    // Send initial data if available
+    // Send initial active clients list
+    const initialActiveClients = [];
+    for (const [ip, info] of activePCs) {
+        initialActiveClients.push({
+            ip: ip,
+            ...info
+        });
+    }
+    socket.emit('active_clients_update', {
+        type: 'initial',
+        timestamp: new Date().toISOString(),
+        active_clients: initialActiveClients,
+        count: initialActiveClients.length
+    });
+
     if (latestData.records && latestData.records.length > 0) {
         socket.emit('data_update', {
             type: 'initial',
             timestamp: new Date().toISOString(),
             records: latestData.records,
-            count: latestData.count,
-            source: latestData.source,
-            table: latestData.table
+            count: latestData.count
         });
-        console.log(`📤 Sent initial data (${latestData.count} records) to branch ${branchId}`);
+        console.log(`📤 Sent initial data (${latestData.count} records) to client ${branchId}`);
     }
 
-    // Handle filter requests
     socket.on('filter_request', (filters) => {
-        console.log(`🔍 Branch ${branchId} requested filter:`, filters);
+        console.log(`🔍 Client ${branchId} requested filter:`, filters);
         if (!latestData.records || latestData.records.length === 0) {
             socket.emit('filter_response', { 
                 records: [], 
@@ -1088,50 +1246,61 @@ io.on('connection', (socket) => {
             filters,
             timestamp: new Date().toISOString()
         });
-        console.log(`📤 Sent ${filtered.length} filtered records to branch ${branchId}`);
+        console.log(`📤 Sent ${filtered.length} filtered records to client ${branchId}`);
     });
 
-    // Handle refresh requests
     socket.on('refresh_request', () => {
-        console.log(`🔄 Branch ${branchId} requested refresh`);
+        console.log(`🔄 Client ${branchId} requested refresh`);
         if (latestData.records && latestData.records.length > 0) {
             socket.emit('data_update', {
                 type: 'refresh',
                 timestamp: new Date().toISOString(),
                 records: latestData.records,
-                count: latestData.count,
-                source: latestData.source,
-                table: latestData.table
+                count: latestData.count
             });
         }
     });
 
-    // Handle ping/pong
     socket.on('ping', () => {
         socket.emit('pong', { timestamp: new Date().toISOString() });
     });
 
-    // Handle disconnection
     socket.on('disconnect', () => {
-        console.log(`🏢 BRANCH OFFICE DISCONNECTED: ${branchId}`);
+        console.log(`🏢 CLIENT DISCONNECTED: ${branchId} (${clientIp})`);
         connectedBranches.delete(branchId);
+        
+        let removedCount = 0;
+        for (const [ip, info] of activePCs) {
+            const socketIds = info.socket_ids.filter(id => id !== branchId);
+            if (socketIds.length === 0) {
+                activePCs.delete(ip);
+                removedCount++;
+                console.log(`🔌 CLIENT DISCONNECTED: ${ip} (${info.is_local ? 'LOCAL' : 'REMOTE'})`);
+            } else {
+                info.socket_ids = socketIds;
+                activePCs.set(ip, info);
+            }
+        }
+        
+        if (removedCount > 0) {
+            console.log(`📊 ${removedCount} clients disconnected`);
+            broadcastActivePCs();
+        }
     });
 });
 
 // ============================================================
-// SECTION 15: GRACEFUL SHUTDOWN
+// SECTION 16: GRACEFUL SHUTDOWN
 // ============================================================
 
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down gracefully...');
     
-    // Close all socket connections
     for (const [id, socket] of connectedBranches) {
         socket.disconnect();
     }
     connectedBranches.clear();
     
-    // Close server
     server.close(() => {
         console.log('✅ Server closed');
         process.exit(0);
@@ -1139,29 +1308,31 @@ process.on('SIGINT', () => {
 });
 
 // ============================================================
-// SECTION 16: START SERVER
+// SECTION 17: START SERVER
 // ============================================================
 
 server.listen(PORT, '0.0.0.0', () => {
     const macInfo = getServerMacAddress();
+    const serverIps = getServerIps();
+    
     console.log(`
     ═══════════════════════════════════════════════════════
-    🖥️  PC TRACKING & AUTHENTICATION SERVER
+    🖥️  SERVER TRACKING & AUTHENTICATION SYSTEM (REAL-TIME)
     ═══════════════════════════════════════════════════════
-    📍 URL:        http://0.0.0.0:${PORT}
-    🔑 Server MAC: ${macInfo.mac} (${macInfo.interface})
-    🆔 Server ID:  ${macInfo.mac !== 'UNKNOWN' ? macInfo.mac.replace(/:/g, '').toUpperCase() : 'UNKNOWN'}
+    📍 Server IP:    ${serverIps.primary}:${PORT}
+    📍 Local URL:    http://localhost:${PORT}
+    🔑 Server MAC:   ${macInfo.mac} (${macInfo.interface})
+    🆔 Server ID:    ${macInfo.mac !== 'UNKNOWN' ? macInfo.mac.replace(/:/g, '').toUpperCase() : 'UNKNOWN'}
     
-    🔐 PROTECTED ENDPOINTS (Require Whitelist):
-       GET  /testresults  → View test results
-       GET  /data         → View all data
-       POST /data/realtimedata → Receive data stream
+    📊 TRACKING:
+       GET  /all-pcs           → Currently active clients (real-time)
+       GET  /all-pcs-history   → All clients that ever connected
+       GET  /pc/:ip            → Details for a specific client
     
-    📡 PC TRACKING ENDPOINTS:
-       GET  /all-pcs      → See every PC that has connected
-       GET  /pc/:ip       → See details for a specific PC
-       GET  /my-pc-check  → Check your own PC status
-       DELETE /all-pcs    → Clear PC access log
+    🔐 AUTHENTICATION:
+       GET  /my-ip        → Your client IP address
+       GET  /my-pc-check  → Your connection status
+       GET  /server-mac   → Server's unique MAC address
     
     🔑 WHITELIST MANAGEMENT:
        GET    /whitelist           → View whitelist
@@ -1169,21 +1340,10 @@ server.listen(PORT, '0.0.0.0', () => {
        POST   /whitelist/network   → Add network ranges
        DELETE /whitelist           → Remove from whitelist
     
-    🌐 IP QUERY:
-       GET    /my-ip       → Get your server IP address
-       GET    /server-mac  → Get server's unique MAC address (never changes)
+    💡 Test from any client:
+       curl http://${serverIps.primary}:${PORT}/my-ip
+       curl http://${serverIps.primary}:${PORT}/all-pcs
     
-    💡 Test from your PC:
-       curl http://localhost:${PORT}/my-ip
-       curl http://localhost:${PORT}/server-mac
-    
-    📊 View all PCs:
-       curl http://localhost:${PORT}/all-pcs
-    
-    🔑 Add your PC to whitelist:
-       curl -X POST /whitelist/static \\
-         -H "Content-Type: application/json" \\
-         -d '{"ips": ["YOUR_IP_HERE"]}'
     ═══════════════════════════════════════════════════════
     `);
 });
